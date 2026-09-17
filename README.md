@@ -111,19 +111,43 @@ Shared by all three:
   `NULL` instead of failing the query. The default is `fail`.
 - `SELECT * FROM jev_usage()` reports what the process has spent so far: requests,
   cache hits, and the input and output tokens the API charged. A careless query over
-  a large table is a large bill; this is the warning.
+  a large table is a large bill; this is the warning. The counters and the answer
+  cache are process-wide, not per connection or per database.
 
 Not yet: a build in the community extensions registry, a wasm target, a per-call
 `on_error`, and the answer probabilities as a `MAP` column.
 
 ## Tests
 
-Two suites, both at the SQL seam:
+Three suites, all at the SQL seam. `make test` is the DuckDB standard and is what
+the distribution pipeline runs on every platform.
 
 ```sh
-make test                          # bind-time behaviour, no network
-python3 test/python/test_http.py   # a mock endpoint replaying a recorded response
+make test        # test/sql/*.test: bind-time behaviour, no network
+make test_http   # a mock endpoint: one POST per row, cache, retry, concurrency, on_error
+make test_live   # test/live/*.test against api.typesafe.ai; skipped without TYPESAFE_API_KEY
+make test_all
 ```
+
+The live suite is pure SQL. It reads the key with `require-env` and never stores it.
+
+**Why is there Python in the tests?** The mock suite needs a server that answers
+with a recorded response and fails when told to, so that retry, the cache and
+`on_error` can be tested without spending a token. Python's standard library has
+that server in forty lines. Writing it in C++ would need a second build target for
+no gain, and Python is already required by the DuckDB toolchain this repo builds
+with: the format and tidy targets are Python scripts. The two peer extensions that
+test HTTP behaviour made the same choice.
+
+## CI
+
+Two workflows.
+
+- `MainDistributionPipeline.yml` is the DuckDB standard, unchanged: every platform,
+  `make test`, clang-format, clang-tidy.
+- `behaviour.yml` builds once on Linux and runs `make test_http` and `make test_live`.
+  The live suite turns on when a `TYPESAFE_API_KEY` repository secret exists and
+  reports itself skipped otherwise.
 
 ## Building
 

@@ -9,8 +9,8 @@ import json, os, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DUCKDB = os.path.join(ROOT, "build/release/duckdb")
-EXT = os.path.join(ROOT, "build/release/extension/jev/jev.duckdb_extension")
+DUCKDB = os.environ.get("DUCKDB_BIN") or os.path.join(ROOT, "build/release/duckdb")
+EXT = os.environ.get("JEV_EXTENSION") or os.path.join(ROOT, "build/release/extension/jev/jev.duckdb_extension")
 
 # Recorded 2026-09-17, model jev-1.13.0, state "I want a refund for last month..."
 RECORDED = {
