@@ -61,8 +61,24 @@ class Mock(BaseHTTPRequestHandler):
             self.wfile.write(b"{}")
             return
         requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
-        q = body["questions"]["q"]
         resp = json.loads(json.dumps(RECORDED))
+        if set(body["questions"]) != {"q"}:
+            # jev_ask: several named questions in one request; answer each from the
+            # recorded response by matching on its type
+            by_type = {
+                "choice": RECORDED["answers"]["intent"],
+                "score": RECORDED["answers"]["severity"],
+                "noul": RECORDED["answers"]["urgent"],
+            }
+            resp["answers"] = {name: by_type[q["type"]] for name, q in body["questions"].items()}
+            out = json.dumps(resp).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        q = body["questions"]["q"]
         if q["type"] == "choice":
             # answer with whichever option the state names, else the recorded answer
             state = body["state"].lower()
@@ -285,6 +301,43 @@ def test_on_error_rejects_unknown_modes(url):
     print("PASS on_error_validation: unknown mode rejected at SET")
 
 
+def test_ask_is_one_request_with_every_question(url):
+    """Jev bills per state. Three questions about one row must be one POST carrying
+    three named questions, and the struct fields come back typed."""
+    requests.clear()
+    rows = sql(
+        url,
+        """
+        WITH asked AS (
+            SELECT jev_ask('I want a refund for last month, the charge was wrong', {
+                intent:   MAP{'refund':'wants money back','bug':'something broken','praise':'a compliment'},
+                severity: ['trivial','minor','normal','serious','critical'],
+                urgent:   MAP{'true':'needs a reply today','false':'can wait'}
+            }) AS a)
+        SELECT a.intent, a.intent_confidence, a.severity, a.severity_confidence, a.urgent FROM asked;""",
+    )
+    assert len(requests) == 1, f"three questions must be one request, got {len(requests)}"
+    qs = requests[0]["body"]["questions"]
+    assert set(qs) == {"intent", "severity", "urgent"}, qs
+    assert qs["intent"]["type"] == "choice" and qs["severity"]["type"] == "score" and qs["urgent"]["type"] == "noul", qs
+    assert qs["severity"]["criteria"] == [
+        "trivial",
+        "minor",
+        "normal",
+        "serious",
+        "critical",
+    ], qs["severity"]
+    a = rows[0]
+    assert a == {
+        "intent": "refund",
+        "intent_confidence": 1.0,
+        "severity": 2.1,
+        "severity_confidence": 0.9,
+        "urgent": 0.6,
+    }, a
+    print("PASS ask_one_request: 3 questions, 1 POST, typed struct from the recorded answers")
+
+
 def main():
     from http.server import ThreadingHTTPServer
 
@@ -301,6 +354,7 @@ def main():
         test_score_and_noul_send_the_api_shape_and_return_doubles,
         test_on_error_null_turns_an_exhausted_row_into_null,
         test_on_error_rejects_unknown_modes,
+        test_ask_is_one_request_with_every_question,
     ):
         try:
             test(url)

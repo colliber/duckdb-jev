@@ -62,7 +62,7 @@ static const char *TypeName(JevQuestionType type) {
 	}
 }
 
-string JevClient::BuildRequest(const string &state, const JevQuestion &question) {
+string JevClient::BuildRequest(const string &state, const JevQuestions &questions) {
 	unique_ptr<yyjson_mut_doc, void (*)(yyjson_mut_doc *)> doc(yyjson_mut_doc_new(nullptr), &yyjson_mut_doc_free);
 	auto root = yyjson_mut_obj(doc.get());
 	yyjson_mut_doc_set_root(doc.get(), root);
@@ -70,24 +70,27 @@ string JevClient::BuildRequest(const string &state, const JevQuestion &question)
 	yyjson_mut_obj_add_strn(doc.get(), root, "state", state.c_str(), state.size());
 	yyjson_mut_obj_add_str(doc.get(), root, "model", settings.model.c_str());
 
-	auto questions = yyjson_mut_obj(doc.get());
-	auto q = yyjson_mut_obj(doc.get());
-	yyjson_mut_obj_add_str(doc.get(), q, "type", TypeName(question.type));
-	if (question.type == JevQuestionType::SCORE) {
-		auto criteria = yyjson_mut_arr(doc.get());
-		for (auto &level : question.criteria_list) {
-			yyjson_mut_arr_add_strn(doc.get(), criteria, level.c_str(), level.size());
+	auto questions_obj = yyjson_mut_obj(doc.get());
+	for (auto &named : questions) {
+		auto &question = named.second;
+		auto q = yyjson_mut_obj(doc.get());
+		yyjson_mut_obj_add_str(doc.get(), q, "type", TypeName(question.type));
+		if (question.type == JevQuestionType::SCORE) {
+			auto criteria = yyjson_mut_arr(doc.get());
+			for (auto &level : question.criteria_list) {
+				yyjson_mut_arr_add_strn(doc.get(), criteria, level.c_str(), level.size());
+			}
+			yyjson_mut_obj_add_val(doc.get(), q, "criteria", criteria);
+		} else {
+			auto criteria = yyjson_mut_obj(doc.get());
+			for (auto &kv : question.criteria_map) {
+				yyjson_mut_obj_add_strn(doc.get(), criteria, kv.first.c_str(), kv.second.c_str(), kv.second.size());
+			}
+			yyjson_mut_obj_add_val(doc.get(), q, "criteria", criteria);
 		}
-		yyjson_mut_obj_add_val(doc.get(), q, "criteria", criteria);
-	} else {
-		auto criteria = yyjson_mut_obj(doc.get());
-		for (auto &kv : question.criteria_map) {
-			yyjson_mut_obj_add_strn(doc.get(), criteria, kv.first.c_str(), kv.second.c_str(), kv.second.size());
-		}
-		yyjson_mut_obj_add_val(doc.get(), q, "criteria", criteria);
+		yyjson_mut_obj_add_val(doc.get(), questions_obj, named.first.c_str(), q);
 	}
-	yyjson_mut_obj_add_val(doc.get(), questions, QUESTION_KEY, q);
-	yyjson_mut_obj_add_val(doc.get(), root, "questions", questions);
+	yyjson_mut_obj_add_val(doc.get(), root, "questions", questions_obj);
 
 	size_t len = 0;
 	auto json = yyjson_mut_write(doc.get(), 0, &len);
@@ -127,17 +130,7 @@ string JevClient::Post(const string &body) {
 	}
 }
 
-JevAnswer JevClient::ParseResponse(const string &body, JevQuestionType type) {
-	unique_ptr<yyjson_doc, void (*)(yyjson_doc *)> doc(yyjson_read(body.c_str(), body.size(), 0), &yyjson_doc_free);
-	if (!doc) {
-		throw IOException("jev: response is not valid JSON");
-	}
-	auto root = yyjson_doc_get_root(doc.get());
-	auto answers = yyjson_obj_get(root, "answers");
-	auto answer = answers ? yyjson_obj_get(answers, QUESTION_KEY) : nullptr;
-	if (!answer) {
-		throw IOException("jev: response has no answers.%s", QUESTION_KEY);
-	}
+static JevAnswer ParseAnswer(yyjson_val *answer, const string &name, JevQuestionType type) {
 	JevAnswer out;
 	auto confidence = yyjson_obj_get(answer, "confidence");
 	if (confidence && yyjson_is_num(confidence)) {
@@ -147,21 +140,42 @@ JevAnswer JevClient::ParseResponse(const string &body, JevQuestionType type) {
 	auto value = yyjson_obj_get(answer, field);
 	if (type == JevQuestionType::CHOICE) {
 		if (!value || !yyjson_is_str(value)) {
-			throw IOException("jev: response has no string answers.%s.choice", QUESTION_KEY);
+			throw IOException("jev: response has no string answers.%s.choice", name);
 		}
 		out.choice = yyjson_get_str(value);
 	} else {
 		if (!value || !yyjson_is_num(value)) {
-			throw IOException("jev: response has no numeric answers.%s.%s", QUESTION_KEY, field);
+			throw IOException("jev: response has no numeric answers.%s.%s", name, field);
 		}
 		out.number = yyjson_get_num(value);
 	}
 	return out;
 }
 
-JevAnswer JevClient::Ask(const string &state, const JevQuestion &question) {
-	auto request = BuildRequest(state, question);
-	// The request body already encodes state, model, type and criteria; add the
+JevAnswers JevClient::ParseResponse(const string &body, const JevQuestions &questions) {
+	unique_ptr<yyjson_doc, void (*)(yyjson_doc *)> doc(yyjson_read(body.c_str(), body.size(), 0), &yyjson_doc_free);
+	if (!doc) {
+		throw IOException("jev: response is not valid JSON");
+	}
+	auto root = yyjson_doc_get_root(doc.get());
+	auto answers = yyjson_obj_get(root, "answers");
+	if (!answers) {
+		throw IOException("jev: response has no answers");
+	}
+	JevAnswers out;
+	for (auto &named : questions) {
+		auto answer = yyjson_obj_get(answers, named.first.c_str());
+		if (!answer) {
+			throw IOException("jev: response has no answers.%s", named.first);
+		}
+		out[named.first] = ParseAnswer(answer, named.first, named.second.type);
+	}
+	return out;
+}
+
+JevAnswers JevClient::Ask(const string &state, const JevQuestions &questions) {
+	auto request = BuildRequest(state, questions);
+	// The request body already encodes state, model, types and criteria; add the
 	// endpoint so two services never share an answer.
 	auto key = settings.endpoint + "\x1f" + request;
 	string response;
@@ -169,7 +183,13 @@ JevAnswer JevClient::Ask(const string &state, const JevQuestion &question) {
 		response = Post(request);
 		CachePut(key, response);
 	}
-	return ParseResponse(response, question.type);
+	return ParseResponse(response, questions);
+}
+
+JevAnswer JevClient::Ask(const string &state, const JevQuestion &question) {
+	JevQuestions one;
+	one.emplace_back(QUESTION_KEY, question);
+	return Ask(state, one)[QUESTION_KEY];
 }
 
 } // namespace duckdb

@@ -68,13 +68,32 @@ A real response, for the ticket "I want a refund for last month, the charge was 
 
 ## Status
 
-Working, three functions, each checked end to end against the live API:
+Working, four functions, each checked end to end against the live API:
 
 | Function | Criteria | Returns |
 |---|---|---|
 | `jev_choice(state, MAP{option: description})` | the option set | `ENUM(options...)`, built at bind |
 | `jev_score(state, [level, ...])` | an ordered rubric | `DOUBLE` on that scale |
 | `jev_noul(state, MAP{'true': ..., 'false': ...})` | what each answer means | `DOUBLE`, the probability of true |
+| `jev_ask(state, {name: criteria, ...})` | any mix of the above | `STRUCT`, one typed field per question |
+
+`jev_ask` is the one to use for more than one question. Jev bills per state, so three
+questions about a row cost one request through `jev_ask` and three through the
+scalar functions. The field type follows the criteria shape: a `MAP` is a choice and
+becomes an `ENUM`, a `LIST` is a rubric and becomes a `DOUBLE`, and a `MAP` whose keys
+are only `true` and `false` is a yes/no question. Choice and score fields carry a
+`<name>_confidence` beside them.
+
+```sql
+WITH asked AS (
+    SELECT id, jev_ask(body, {
+        intent:   MAP{'refund': 'wants money back', 'bug': 'something broken'},
+        severity: ['trivial', 'minor', 'normal', 'serious', 'critical'],
+        urgent:   MAP{'true': 'needs a reply today', 'false': 'can wait'}
+    }) AS a FROM tickets)
+SELECT id, a.intent, a.severity, a.urgent
+FROM asked WHERE a.intent_confidence > 0.8;
+```
 
 Shared by all three:
 
@@ -88,8 +107,10 @@ Shared by all three:
 
 - Retry with backoff on 429 and 5xx, up to four attempts. Any other 4xx fails once.
 
-Next, in order: an `on_error` mode (fail, null, capture), `jev_ask` returning a
-struct so many questions cost one call, and usage accounting.
+- `SET jev_on_error = 'null'` turns a row whose request failed after its retries into
+  `NULL` instead of failing the query. The default is `fail`.
+
+Next: usage accounting, so a query reports the tokens it spent.
 
 ## Tests
 
