@@ -1,27 +1,28 @@
-# Behaviour tests: everything the standard distribution pipeline does not cover.
+# PR gate. Two jobs, one build.
 #
-# MainDistributionPipeline.yml is the DuckDB standard: it builds every platform and
-# runs the sqllogictests in test/sql with `make test`. It runs inside DuckDB's Docker
-# images, accepts no secrets of ours, and has no server that can fail on demand.
-# This workflow builds once on Linux and adds the two suites that need more:
+#   format   the DuckDB format check: clang-format, black, cmake-format. No build,
+#            about a minute. Tidy needs a full build and runs on main instead.
+#   build    one Linux build, then every suite:
+#              make test        sqllogictests, the DuckDB standard
+#              make test_http   a mock endpoint that replays a recorded response and
+#                               fails when told to: cache, retry, concurrency, on_error
+#              make test_live   test/live against api.typesafe.ai, pure SQL, skipped
+#                               unless the TYPESAFE_API_KEY secret is set
 #
-#   make test_http   a mock endpoint that replays a recorded response and fails
-#                    when told to, so cache, retry, concurrency and on_error are
-#                    tested without spending a token
-#   make test_live   test/live/*.test against api.typesafe.ai, pure SQL,
-#                    skipped unless the TYPESAFE_API_KEY secret is set
+# The twelve-platform distribution matrix and clang-tidy run on main, on tags and on
+# demand (MainDistributionPipeline.yml, workflow_dispatch). Run it on a branch before
+# merging anything that touches the build or platform-specific code.
 #
 # No key is stored here. Add TYPESAFE_API_KEY as a repository secret to turn the
 # live suite on; without it the suite reports itself skipped and the job passes.
-name: Behaviour tests
+name: CI
 
 on:
-  push:
   pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: behaviour-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -29,8 +30,17 @@ env:
   VCPKG_COMMIT: 84bab45d415d22042bd0b9081aea57f362da3f35
 
 jobs:
-  behaviour:
-    name: Build once, run mock and live suites
+  format:
+    name: Format check
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5-variegata
+      extension_name: jev
+      format_checks: 'format'
+
+  build:
+    name: Build once, run every suite
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
