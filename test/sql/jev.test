@@ -1,0 +1,43 @@
+# name: test/sql/jev.test
+# description: bind-time ENUM return types for jev_choice
+# group: [jev]
+
+require jev
+
+# The return type is an ENUM derived from the criteria map keys.
+query I
+SELECT typeof(jev_choice('anything', MAP{'refund':'wants money back','bug':'something broken'}));
+----
+ENUM('refund', 'bug')
+
+# A different call site gets a different type.
+query I
+SELECT typeof(jev_choice('anything', MAP{'yes':'affirmative','no':'negative'}));
+----
+ENUM('yes', 'no')
+
+# The value is a real enum member, comparable without a cast.
+query I
+SELECT jev_choice('anything', MAP{'refund':'wants money back','bug':'something broken'}) = 'refund';
+----
+true
+
+# Comparing against a value outside the enum is an error, not a silent false.
+statement error
+SELECT jev_choice('x', MAP{'a':'first','b':'second'}) = 'nonsense';
+----
+
+# Bind rejects an empty criteria map before execution.
+statement error
+SELECT jev_choice('x', MAP{}::MAP(VARCHAR, VARCHAR));
+----
+must not be empty
+
+# Bind rejects a non-constant criteria map.
+statement error
+CREATE TABLE t2 AS SELECT 'x' AS body, MAP{'a':'first'} AS c;
+
+statement error
+SELECT jev_choice(body, c) FROM t2;
+----
+must be a constant

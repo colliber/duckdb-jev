@@ -6,3 +6,9 @@ duckdb_unittest_tempdir/
 testext
 test/python/__pycache__/
 .Rhistory
+
+# secrets — never commit an API key
+.env
+.jevenv
+*.key
+secrets/
