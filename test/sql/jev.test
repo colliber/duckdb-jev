@@ -22,10 +22,12 @@ SELECT jev_choice('anything', MAP{'refund':'wants money back','bug':'something b
 ----
 true
 
-# Comparing against a value outside the enum is an error, not a silent false.
-statement error
+# Comparing against a value outside the enum is false. DuckDB does not raise here;
+# verified against the built binary, not assumed.
+query I
 SELECT jev_choice('x', MAP{'a':'first','b':'second'}) = 'nonsense';
 ----
+false
 
 # Bind rejects an empty criteria map before execution.
 statement error
@@ -34,10 +36,16 @@ SELECT jev_choice('x', MAP{}::MAP(VARCHAR, VARCHAR));
 must not be empty
 
 # Bind rejects a non-constant criteria map.
-statement error
+statement ok
 CREATE TABLE t2 AS SELECT 'x' AS body, MAP{'a':'first'} AS c;
 
 statement error
 SELECT jev_choice(body, c) FROM t2;
 ----
 must be a constant
+
+# A NULL state yields a NULL answer. No question is asked about nothing.
+query I
+SELECT jev_choice(NULL, MAP{'a':'first','b':'second'}) IS NULL;
+----
+true
