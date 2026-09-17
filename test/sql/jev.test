@@ -71,3 +71,29 @@ statement error
 SELECT jev_noul('x', MAP{'yes':'a','no':'b'});
 ----
 true
+
+# jev_ask asks several questions in one request and returns a typed STRUCT.
+# The field type follows the criteria shape: a MAP is a choice and becomes an
+# ENUM; a LIST is a score rubric and becomes a DOUBLE; a MAP whose keys are only
+# true/false is a noul and becomes a DOUBLE. Choice and score carry a confidence.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT jev_ask('anything', {
+    intent:   MAP{'refund':'wants money back','bug':'something broken'},
+    severity: ['trivial','minor','normal','serious','critical'],
+    urgent:   MAP{'true':'needs a reply today','false':'can wait'}
+}) AS a);
+----
+a	STRUCT(intent ENUM('refund', 'bug'), intent_confidence DOUBLE, severity DOUBLE, severity_confidence DOUBLE, urgent DOUBLE)
+
+# The questions argument must be a STRUCT of name: criteria. An empty struct
+# literal is a parser error in DuckDB, so a non-struct is the reachable case.
+statement error
+SELECT jev_ask('x', 42);
+----
+must be a STRUCT
+
+# Each field's criteria must be a MAP or a LIST.
+statement error
+SELECT jev_ask('x', {mood: 'happy'});
+----
+must be a MAP

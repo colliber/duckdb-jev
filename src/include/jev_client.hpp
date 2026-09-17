@@ -27,13 +27,21 @@ struct JevAnswer {
 	double confidence = 0; // choice, score
 };
 
-//! Talks to POST {endpoint}/v1/systemone. One state per request.
+//! Questions by name, in the order they were given.
+using JevQuestions = vector<std::pair<string, JevQuestion>>;
+//! Answers by question name.
+using JevAnswers = unordered_map<string, JevAnswer>;
+
+//! Talks to POST {endpoint}/v1/systemone. One state per request, any number of
+//! questions: that is the only lever the API offers on cost and latency.
 class JevClient {
 public:
 	explicit JevClient(JevSettings settings) : settings(std::move(settings)) {
 	}
 	//! Ask one question about one state. Throws on transport or protocol error.
 	JevAnswer Ask(const string &state, const JevQuestion &question);
+	//! Ask several named questions about one state in a single request.
+	JevAnswers Ask(const string &state, const JevQuestions &questions);
 
 private:
 	JevSettings settings;
@@ -42,9 +50,9 @@ private:
 	//! in SELECT would otherwise be two paid requests.
 	static bool CacheGet(const string &key, string &body);
 	static void CachePut(const string &key, const string &body);
-	string BuildRequest(const string &state, const JevQuestion &question);
+	string BuildRequest(const string &state, const JevQuestions &questions);
 	string Post(const string &body);
-	JevAnswer ParseResponse(const string &body, JevQuestionType type);
+	JevAnswers ParseResponse(const string &body, const JevQuestions &questions);
 };
 
 } // namespace duckdb
