@@ -7,40 +7,34 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
-#include <thread>
-#include <atomic>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include "jev_secret.hpp"
 #include "jev_client.hpp"
 
+#include <atomic>
+#include <thread>
+
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
-// jev_choice(state, criteria) -> ENUM built from the criteria keys
-//
-// The Jev API takes a Choice question as a map of option -> description
-// (verified against https://api.typesafe.ai/openapi.json, ChoiceQuestion.criteria
-// is an object, not a list). The keys of that same map become the SQL ENUM, so
-// the column type and the model's option set cannot drift apart.
+// Bind data shared by every function: the question, and where to send it.
 //===--------------------------------------------------------------------===//
-
-struct JevChoiceBindData : public FunctionData {
-	JevChoiceQuestion question;
+struct JevBindData : public FunctionData {
+	JevQuestion question;
 	JevSettings settings;
-	JevChoiceBindData(JevChoiceQuestion q, JevSettings s) : question(std::move(q)), settings(std::move(s)) {
+	JevBindData(JevQuestion q, JevSettings s) : question(std::move(q)), settings(std::move(s)) {
 	}
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<JevChoiceBindData>(question, settings);
+		return make_uniq<JevBindData>(question, settings);
 	}
 	bool Equals(const FunctionData &other) const override {
-		auto &o = other.Cast<JevChoiceBindData>();
-		return question.criteria == o.question.criteria && settings.endpoint == o.settings.endpoint &&
-		       settings.model == o.settings.model;
+		auto &o = other.Cast<JevBindData>();
+		return question == o.question && settings.endpoint == o.settings.endpoint && settings.model == o.settings.model;
 	}
 	//! Enum index of an option name, or -1 when the model answered off-list.
 	int64_t IndexOf(const string &option) const {
-		for (idx_t i = 0; i < question.criteria.size(); i++) {
-			if (question.criteria[i].first == option) {
+		for (idx_t i = 0; i < question.criteria_map.size(); i++) {
+			if (question.criteria_map[i].first == option) {
 				return (int64_t)i;
 			}
 		}
@@ -48,57 +42,121 @@ struct JevChoiceBindData : public FunctionData {
 	}
 };
 
-static unique_ptr<FunctionData> JevChoiceBind(ClientContext &context, ScalarFunction &bound_function,
-                                              vector<unique_ptr<Expression>> &args) {
+//! The criteria argument decides the return type, and a type must be known at plan
+//! time. So it has to be a constant. Evaluate it, or explain why not.
+static Value ConstantCriteria(ClientContext &context, const string &fn, vector<unique_ptr<Expression>> &args) {
 	if (args.size() != 2) {
-		throw BinderException("jev_choice(state, criteria) takes exactly two arguments");
+		throw BinderException("%s(state, criteria) takes exactly two arguments", fn);
 	}
-	// The return TYPE depends on this argument, and a type must be known at plan
-	// time. So the criteria map has to be a constant. This is the whole design.
 	if (!args[1]->IsFoldable()) {
-		throw BinderException("jev_choice: the criteria map must be a constant");
+		throw BinderException("%s: the criteria argument must be a constant", fn);
 	}
-	auto criteria = ExpressionExecutor::EvaluateScalar(context, *args[1]);
-	if (criteria.IsNull()) {
-		throw BinderException("jev_choice: the criteria map must not be NULL");
+	auto value = ExpressionExecutor::EvaluateScalar(context, *args[1]);
+	if (value.IsNull()) {
+		throw BinderException("%s: the criteria argument must not be NULL", fn);
 	}
+	return value;
+}
 
-	auto &entries = MapValue::GetChildren(criteria);
-	if (entries.empty()) {
-		throw BinderException("jev_choice: the criteria map must not be empty");
-	}
-	if (entries.size() > 255) {
-		throw BinderException("jev_choice: at most 255 options, got %llu", (unsigned long long)entries.size());
-	}
-
-	JevChoiceQuestion question;
-	Vector ordered(LogicalType::VARCHAR, entries.size());
-	auto data = FlatVector::GetData<string_t>(ordered);
+//! Reads a MAP(VARCHAR, VARCHAR) constant into ordered key/description pairs.
+static vector<std::pair<string, string>> ReadCriteriaMap(const string &fn, const Value &map) {
+	auto &entries = MapValue::GetChildren(map);
+	vector<std::pair<string, string>> out;
 	for (idx_t i = 0; i < entries.size(); i++) {
 		auto &kv = StructValue::GetChildren(entries[i]);
 		if (kv[0].IsNull()) {
-			throw BinderException("jev_choice: option name %llu is NULL", (unsigned long long)i);
+			throw BinderException("%s: criteria key %llu is NULL", fn, (unsigned long long)i);
 		}
-		auto name = kv[0].ToString();
-		question.criteria.emplace_back(name, kv[1].IsNull() ? string() : kv[1].ToString());
-		data[i] = StringVector::AddString(ordered, name);
+		out.emplace_back(kv[0].ToString(), kv[1].IsNull() ? string() : kv[1].ToString());
 	}
-	// Throws on duplicate option names; that is the behaviour we want.
-	bound_function.return_type = LogicalType::ENUM(ordered, entries.size());
-	// Fail now, not at row one, when there is no secret to call the API with.
-	auto settings = ResolveJevSettings(context);
-	return make_uniq<JevChoiceBindData>(std::move(question), std::move(settings));
+	return out;
 }
 
-// One POST per row is the API's floor: a request carries exactly one state. But the
-// rows of a chunk are independent, so they are requested concurrently rather than
-// waited for in turn. The pool is per chunk and bounded; DuckDB may already be
-// running several chunks on several threads.
+//===--------------------------------------------------------------------===//
+// jev_choice(state, MAP{option: description}) -> ENUM(options...)
+//
+// The keys of the criteria map become the SQL ENUM, so the column type and the
+// option set the model is constrained to come from one literal and cannot drift.
+//===--------------------------------------------------------------------===//
+static unique_ptr<FunctionData> JevChoiceBind(ClientContext &context, ScalarFunction &bound_function,
+                                              vector<unique_ptr<Expression>> &args) {
+	auto criteria = ConstantCriteria(context, "jev_choice", args);
+	JevQuestion question;
+	question.type = JevQuestionType::CHOICE;
+	question.criteria_map = ReadCriteriaMap("jev_choice", criteria);
+	if (question.criteria_map.empty()) {
+		throw BinderException("jev_choice: the criteria map must not be empty");
+	}
+	if (question.criteria_map.size() > 255) {
+		throw BinderException("jev_choice: at most 255 options, got %llu",
+		                      (unsigned long long)question.criteria_map.size());
+	}
+	Vector ordered(LogicalType::VARCHAR, question.criteria_map.size());
+	auto data = FlatVector::GetData<string_t>(ordered);
+	for (idx_t i = 0; i < question.criteria_map.size(); i++) {
+		data[i] = StringVector::AddString(ordered, question.criteria_map[i].first);
+	}
+	// Throws on duplicate option names; that is the behaviour we want.
+	bound_function.return_type = LogicalType::ENUM(ordered, question.criteria_map.size());
+	// Fail now, not at row one, when there is no secret to call the API with.
+	auto settings = ResolveJevSettings(context);
+	return make_uniq<JevBindData>(std::move(question), std::move(settings));
+}
+
+//===--------------------------------------------------------------------===//
+// jev_score(state, [level, level, ...]) -> DOUBLE on the rubric scale
+//===--------------------------------------------------------------------===//
+static unique_ptr<FunctionData> JevScoreBind(ClientContext &context, ScalarFunction &bound_function,
+                                             vector<unique_ptr<Expression>> &args) {
+	auto criteria = ConstantCriteria(context, "jev_score", args);
+	JevQuestion question;
+	question.type = JevQuestionType::SCORE;
+	for (auto &level : ListValue::GetChildren(criteria)) {
+		if (level.IsNull()) {
+			throw BinderException("jev_score: a rubric level is NULL");
+		}
+		question.criteria_list.push_back(level.ToString());
+	}
+	if (question.criteria_list.size() < 2) {
+		throw BinderException("jev_score: the rubric needs at least two levels to be a scale");
+	}
+	auto settings = ResolveJevSettings(context);
+	return make_uniq<JevBindData>(std::move(question), std::move(settings));
+}
+
+//===--------------------------------------------------------------------===//
+// jev_noul(state, MAP{'true': meaning, 'false': meaning}) -> DOUBLE, P(true)
+//===--------------------------------------------------------------------===//
+static unique_ptr<FunctionData> JevNoulBind(ClientContext &context, ScalarFunction &bound_function,
+                                            vector<unique_ptr<Expression>> &args) {
+	auto criteria = ConstantCriteria(context, "jev_noul", args);
+	JevQuestion question;
+	question.type = JevQuestionType::NOUL;
+	question.criteria_map = ReadCriteriaMap("jev_noul", criteria);
+	if (question.criteria_map.empty()) {
+		throw BinderException("jev_noul: the criteria map must not be empty");
+	}
+	for (auto &kv : question.criteria_map) {
+		if (kv.first != "true" && kv.first != "false") {
+			throw BinderException("jev_noul: criteria keys must be 'true' or 'false', got '%s'", kv.first);
+		}
+	}
+	auto settings = ResolveJevSettings(context);
+	return make_uniq<JevBindData>(std::move(question), std::move(settings));
+}
+
+//===--------------------------------------------------------------------===//
+// Execution. One POST per row is the API's floor: a request carries exactly one
+// state. But the rows of a chunk are independent, so they are requested
+// concurrently rather than waited for in turn. The pool is per chunk and bounded;
+// DuckDB may already be running several chunks on several threads.
+//===--------------------------------------------------------------------===//
 static constexpr idx_t MAX_CONCURRENT_REQUESTS = 16;
 
-static void JevChoiceExec(DataChunk &args, ExpressionState &state, Vector &result) {
+template <class T, class WRITE>
+static void JevExecConcurrent(DataChunk &args, ExpressionState &state, Vector &result, WRITE write) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind = func_expr.bind_info->Cast<JevChoiceBindData>();
+	auto &bind = func_expr.bind_info->Cast<JevBindData>();
 	auto count = args.size();
 
 	UnifiedVectorFormat input;
@@ -106,7 +164,7 @@ static void JevChoiceExec(DataChunk &args, ExpressionState &state, Vector &resul
 	auto input_data = UnifiedVectorFormat::GetData<string_t>(input);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto out = FlatVector::GetData<uint8_t>(result);
+	auto out = FlatVector::GetData<T>(result);
 	auto &out_validity = FlatVector::Validity(result);
 
 	// Gather the rows that need a request. NULL in, NULL out, no request.
@@ -135,15 +193,8 @@ static void JevChoiceExec(DataChunk &args, ExpressionState &state, Vector &resul
 			auto row = pending[i];
 			auto idx = input.sel->get_index(row);
 			try {
-				auto answer = client.AskChoice(input_data[idx].GetString(), bind.question);
-				auto option = bind.IndexOf(answer.choice);
-				if (option < 0) {
-					// The model is constrained to the option set; reaching this means the
-					// service broke its contract. Surface it, do not coerce it.
-					throw IOException("jev_choice: the model answered '%s', which is not one of the options",
-					                  answer.choice);
-				}
-				out[row] = (uint8_t)option;
+				auto answer = client.Ask(input_data[idx].GetString(), bind.question);
+				out[row] = write(bind, answer);
 			} catch (std::exception &ex) {
 				std::lock_guard<std::mutex> guard(error_lock);
 				if (first_error.empty()) {
@@ -169,13 +220,40 @@ static void JevChoiceExec(DataChunk &args, ExpressionState &state, Vector &resul
 	}
 }
 
+static void JevChoiceExec(DataChunk &args, ExpressionState &state, Vector &result) {
+	JevExecConcurrent<uint8_t>(args, state, result, [](const JevBindData &bind, const JevAnswer &answer) {
+		auto option = bind.IndexOf(answer.choice);
+		if (option < 0) {
+			// The model is constrained to the option set; reaching this means the
+			// service broke its contract. Surface it, do not coerce it.
+			throw IOException("jev_choice: the model answered '%s', which is not one of the options", answer.choice);
+		}
+		return (uint8_t)option;
+	});
+}
+
+static void JevNumberExec(DataChunk &args, ExpressionState &state, Vector &result) {
+	JevExecConcurrent<double>(args, state, result,
+	                          [](const JevBindData &, const JevAnswer &answer) { return answer.number; });
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterJevSecret(loader);
-	ScalarFunction jev_choice("jev_choice", {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)},
-	                          LogicalType::ANY, JevChoiceExec, JevChoiceBind);
+
+	auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+
+	// Registered with a placeholder return type; bind overwrites it per call site.
+	ScalarFunction jev_choice("jev_choice", {LogicalType::VARCHAR, map_type}, LogicalType::ANY, JevChoiceExec,
+	                          JevChoiceBind);
+	ScalarFunction jev_score("jev_score", {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)},
+	                         LogicalType::DOUBLE, JevNumberExec, JevScoreBind);
+	ScalarFunction jev_noul("jev_noul", {LogicalType::VARCHAR, map_type}, LogicalType::DOUBLE, JevNumberExec,
+	                        JevNoulBind);
 	// A network call is not a pure function. This also stops DuckDB folding it.
-	jev_choice.stability = FunctionStability::VOLATILE;
-	loader.RegisterFunction(jev_choice);
+	for (auto fn : {&jev_choice, &jev_score, &jev_noul}) {
+		fn->stability = FunctionStability::VOLATILE;
+		loader.RegisterFunction(*fn);
+	}
 }
 
 void JevExtension::Load(ExtensionLoader &loader) {

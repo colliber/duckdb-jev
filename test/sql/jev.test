@@ -47,3 +47,27 @@ query I
 SELECT jev_choice(NULL, MAP{'a':'first','b':'second'}) IS NULL;
 ----
 true
+
+# jev_score takes an ordered rubric and returns a DOUBLE on that scale.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT jev_score('anything', ['trivial','minor','normal','serious','critical']) AS severity);
+----
+severity	DOUBLE
+
+# A rubric needs at least two levels to be a scale.
+statement error
+SELECT jev_score('x', ['only one']);
+----
+at least two
+
+# jev_noul takes what true and false mean and returns the probability of true.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT jev_noul('anything', MAP{'true':'needs a reply today','false':'can wait'}) AS urgent);
+----
+urgent	DOUBLE
+
+# Only the keys true and false are meaningful.
+statement error
+SELECT jev_noul('x', MAP{'yes':'a','no':'b'});
+----
+true

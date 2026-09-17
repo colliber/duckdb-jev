@@ -51,7 +51,18 @@ void JevClient::CachePut(const string &key, const string &body) {
 	cache[key] = body;
 }
 
-string JevClient::BuildChoiceRequest(const string &state, const JevChoiceQuestion &question) {
+static const char *TypeName(JevQuestionType type) {
+	switch (type) {
+	case JevQuestionType::CHOICE:
+		return "choice";
+	case JevQuestionType::SCORE:
+		return "score";
+	default:
+		return "noul";
+	}
+}
+
+string JevClient::BuildRequest(const string &state, const JevQuestion &question) {
 	unique_ptr<yyjson_mut_doc, void (*)(yyjson_mut_doc *)> doc(yyjson_mut_doc_new(nullptr), &yyjson_mut_doc_free);
 	auto root = yyjson_mut_obj(doc.get());
 	yyjson_mut_doc_set_root(doc.get(), root);
@@ -61,12 +72,20 @@ string JevClient::BuildChoiceRequest(const string &state, const JevChoiceQuestio
 
 	auto questions = yyjson_mut_obj(doc.get());
 	auto q = yyjson_mut_obj(doc.get());
-	yyjson_mut_obj_add_str(doc.get(), q, "type", "choice");
-	auto criteria = yyjson_mut_obj(doc.get());
-	for (auto &kv : question.criteria) {
-		yyjson_mut_obj_add_strn(doc.get(), criteria, kv.first.c_str(), kv.second.c_str(), kv.second.size());
+	yyjson_mut_obj_add_str(doc.get(), q, "type", TypeName(question.type));
+	if (question.type == JevQuestionType::SCORE) {
+		auto criteria = yyjson_mut_arr(doc.get());
+		for (auto &level : question.criteria_list) {
+			yyjson_mut_arr_add_strn(doc.get(), criteria, level.c_str(), level.size());
+		}
+		yyjson_mut_obj_add_val(doc.get(), q, "criteria", criteria);
+	} else {
+		auto criteria = yyjson_mut_obj(doc.get());
+		for (auto &kv : question.criteria_map) {
+			yyjson_mut_obj_add_strn(doc.get(), criteria, kv.first.c_str(), kv.second.c_str(), kv.second.size());
+		}
+		yyjson_mut_obj_add_val(doc.get(), q, "criteria", criteria);
 	}
-	yyjson_mut_obj_add_val(doc.get(), q, "criteria", criteria);
 	yyjson_mut_obj_add_val(doc.get(), questions, QUESTION_KEY, q);
 	yyjson_mut_obj_add_val(doc.get(), root, "questions", questions);
 
@@ -108,7 +127,7 @@ string JevClient::Post(const string &body) {
 	}
 }
 
-JevChoiceAnswer JevClient::ParseChoiceResponse(const string &body) {
+JevAnswer JevClient::ParseResponse(const string &body, JevQuestionType type) {
 	unique_ptr<yyjson_doc, void (*)(yyjson_doc *)> doc(yyjson_read(body.c_str(), body.size(), 0), &yyjson_doc_free);
 	if (!doc) {
 		throw IOException("jev: response is not valid JSON");
@@ -116,30 +135,41 @@ JevChoiceAnswer JevClient::ParseChoiceResponse(const string &body) {
 	auto root = yyjson_doc_get_root(doc.get());
 	auto answers = yyjson_obj_get(root, "answers");
 	auto answer = answers ? yyjson_obj_get(answers, QUESTION_KEY) : nullptr;
-	auto choice = answer ? yyjson_obj_get(answer, "choice") : nullptr;
-	if (!choice || !yyjson_is_str(choice)) {
-		throw IOException("jev: response has no answers.%s.choice", QUESTION_KEY);
+	if (!answer) {
+		throw IOException("jev: response has no answers.%s", QUESTION_KEY);
 	}
-	JevChoiceAnswer out;
-	out.choice = yyjson_get_str(choice);
+	JevAnswer out;
 	auto confidence = yyjson_obj_get(answer, "confidence");
 	if (confidence && yyjson_is_num(confidence)) {
 		out.confidence = yyjson_get_num(confidence);
 	}
+	const char *field = type == JevQuestionType::CHOICE ? "choice" : type == JevQuestionType::SCORE ? "score" : "noul";
+	auto value = yyjson_obj_get(answer, field);
+	if (type == JevQuestionType::CHOICE) {
+		if (!value || !yyjson_is_str(value)) {
+			throw IOException("jev: response has no string answers.%s.choice", QUESTION_KEY);
+		}
+		out.choice = yyjson_get_str(value);
+	} else {
+		if (!value || !yyjson_is_num(value)) {
+			throw IOException("jev: response has no numeric answers.%s.%s", QUESTION_KEY, field);
+		}
+		out.number = yyjson_get_num(value);
+	}
 	return out;
 }
 
-JevChoiceAnswer JevClient::AskChoice(const string &state, const JevChoiceQuestion &question) {
-	auto request = BuildChoiceRequest(state, question);
-	// The request body already encodes state, model and criteria; add the endpoint
-	// so two services never share an answer.
+JevAnswer JevClient::Ask(const string &state, const JevQuestion &question) {
+	auto request = BuildRequest(state, question);
+	// The request body already encodes state, model, type and criteria; add the
+	// endpoint so two services never share an answer.
 	auto key = settings.endpoint + "\x1f" + request;
 	string response;
 	if (!CacheGet(key, response)) {
 		response = Post(request);
 		CachePut(key, response);
 	}
-	return ParseChoiceResponse(response);
+	return ParseResponse(response, question.type);
 }
 
 } // namespace duckdb

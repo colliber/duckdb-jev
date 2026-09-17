@@ -68,8 +68,15 @@ A real response, for the ticket "I want a refund for last month, the charge was 
 
 ## Status
 
-Working, one function. `jev_choice` proves the design end to end against the live
-API:
+Working, three functions, each checked end to end against the live API:
+
+| Function | Criteria | Returns |
+|---|---|---|
+| `jev_choice(state, MAP{option: description})` | the option set | `ENUM(options...)`, built at bind |
+| `jev_score(state, [level, ...])` | an ordered rubric | `DOUBLE` on that scale |
+| `jev_noul(state, MAP{'true': ..., 'false': ...})` | what each answer means | `DOUBLE`, the probability of true |
+
+Shared by all three:
 
 - `CREATE SECRET (TYPE jev, API_KEY '...')`, with optional `ENDPOINT` and `MODEL`.
   No secret is a bind error, not a row-one failure.
@@ -79,9 +86,10 @@ API:
   per occurrence, so the same call in `WHERE` and `SELECT` was two bills per row.
   Now one.
 
-Next, in order: retry with backoff on 429, `jev_score` and `jev_noul`, an
-`on_error` mode (fail, null, capture), `jev_ask` returning a struct so many
-questions cost one call, and usage accounting.
+- Retry with backoff on 429 and 5xx, up to four attempts. Any other 4xx fails once.
+
+Next, in order: an `on_error` mode (fail, null, capture), `jev_ask` returning a
+struct so many questions cost one call, and usage accounting.
 
 ## Tests
 
