@@ -4,7 +4,7 @@ endpoint named in the jev secret, and maps the answer onto the ENUM.
 The mock replays a real response recorded from api.typesafe.ai on 2026-09-17,
 so the expected values come from the actual service, not from this test.
 """
-import json, os, subprocess, sys, threading
+import json, os, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,8 +19,12 @@ RECORDED = {"model": "jev-1.13.0",
 
 requests = []
 
+DELAY = 0.0   # per-request latency the mock adds; set by a test
+
 class Mock(BaseHTTPRequestHandler):
     def do_POST(self):
+        if DELAY:
+            time.sleep(DELAY)
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
         # answer with whichever option the state names, else the recorded answer
@@ -94,12 +98,33 @@ def test_same_call_in_where_and_select_is_one_request_per_row(url):
     print("PASS where_and_select: 3 rows, 3 requests, second evaluation served from cache")
 
 
+def test_rows_in_a_chunk_are_requested_concurrently(url):
+    """One request per row is the API's floor. Waiting for each in turn is not.
+    16 distinct rows at 200ms each: sequential is 3.2s, concurrent well under 1s."""
+    global DELAY
+    requests.clear(); DELAY = 0.2
+    try:
+        t0 = time.time()
+        rows = sql(url, """
+            CREATE TABLE t AS SELECT 'ticket ' || i || ' mentions a bug' AS body FROM range(16) r(i);
+            SELECT count(*) AS n FROM t WHERE jev_choice(body, MAP{'bug':'b','praise':'p'}) = 'bug';""")
+        elapsed = time.time() - t0
+    finally:
+        DELAY = 0.0
+    assert rows[0]["n"] == 16, rows
+    assert len(requests) == 16, len(requests)
+    assert elapsed < 1.5, f"16 rows at 200ms took {elapsed:.2f}s: requests are sequential"
+    print(f"PASS concurrent_chunk: 16 rows at 200ms in {elapsed:.2f}s")
+
+
 def main():
-    srv = HTTPServer(("127.0.0.1", 0), Mock)
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Mock)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{srv.server_port}"
     failures = 0
-    for test in (test_one_post_per_row, test_same_call_in_where_and_select_is_one_request_per_row):
+    for test in (test_one_post_per_row, test_same_call_in_where_and_select_is_one_request_per_row,
+                 test_rows_in_a_chunk_are_requested_concurrently):
         try:
             test(url)
         except AssertionError as e:
