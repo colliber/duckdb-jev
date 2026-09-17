@@ -1,35 +1,32 @@
 # name: test/sql/jev.test
-# description: bind-time ENUM return types for jev_choice
+# description: bind-time behaviour of jev_choice. Nothing here reaches the network.
 # group: [jev]
 
 require jev
 
-# The return type is an ENUM derived from the criteria map keys.
-query I
-SELECT typeof(jev_choice('anything', MAP{'refund':'wants money back','bug':'something broken'}));
+# Without a secret the query fails at bind, before any row is processed.
+statement error
+SELECT jev_choice('x', MAP{'a':'first','b':'second'});
 ----
-ENUM('refund', 'bug')
+no secret found
+
+statement ok
+CREATE SECRET (TYPE jev, API_KEY 'test-key', ENDPOINT 'http://127.0.0.1:1');
+
+# The return type is an ENUM derived from the criteria map keys.
+# DESCRIBE plans the query without executing it, so no request is made.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT jev_choice('anything', MAP{'refund':'wants money back','bug':'something broken'}) AS intent);
+----
+intent	ENUM('refund', 'bug')
 
 # A different call site gets a different type.
-query I
-SELECT typeof(jev_choice('anything', MAP{'yes':'affirmative','no':'negative'}));
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT jev_choice('anything', MAP{'yes':'affirmative','no':'negative'}) AS answer);
 ----
-ENUM('yes', 'no')
+answer	ENUM('yes', 'no')
 
-# The value is a real enum member, comparable without a cast.
-query I
-SELECT jev_choice('anything', MAP{'refund':'wants money back','bug':'something broken'}) = 'refund';
-----
-true
-
-# Comparing against a value outside the enum is false. DuckDB does not raise here;
-# verified against the built binary, not assumed.
-query I
-SELECT jev_choice('x', MAP{'a':'first','b':'second'}) = 'nonsense';
-----
-false
-
-# Bind rejects an empty criteria map before execution.
+# Bind rejects an empty criteria map.
 statement error
 SELECT jev_choice('x', MAP{}::MAP(VARCHAR, VARCHAR));
 ----
@@ -44,7 +41,8 @@ SELECT jev_choice(body, c) FROM t2;
 ----
 must be a constant
 
-# A NULL state yields a NULL answer. No question is asked about nothing.
+# A NULL state yields a NULL answer without a request. The endpoint above is
+# unreachable, so this would fail loudly if a request were attempted.
 query I
 SELECT jev_choice(NULL, MAP{'a':'first','b':'second'}) IS NULL;
 ----
