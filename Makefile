@@ -27,7 +27,14 @@ test_http:
 # The runner registers tests by their path relative to the project, tagged with the
 # directory name, so test/live/jev.test is `test/live/jev.test [live]`. Filter the
 # same way the standard target filters "test/*".
+# An absent key and an empty key are different things: CI sets the variable to ""
+# when the secret does not exist, and sqllogictest's require-env sees a present
+# variable and runs the test anyway. Skip on either.
 test_live:
-	./build/release/$(TEST_PATH) "test/live/*"
+	@if [ -z "$$TYPESAFE_API_KEY" ]; then \
+		echo "TYPESAFE_API_KEY is not set; skipping the live suite"; \
+	else \
+		./build/release/$(TEST_PATH) "test/live/*"; \
+	fi
 
 test_all: test test_http test_live
