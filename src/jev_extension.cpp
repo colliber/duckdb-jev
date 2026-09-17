@@ -6,7 +6,10 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include "jev_secret.hpp"
+#include "jev_client.hpp"
 
 namespace duckdb {
 
@@ -20,14 +23,26 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 
 struct JevChoiceBindData : public FunctionData {
-	vector<string> options;
-	explicit JevChoiceBindData(vector<string> o) : options(std::move(o)) {
+	JevChoiceQuestion question;
+	JevSettings settings;
+	JevChoiceBindData(JevChoiceQuestion q, JevSettings s) : question(std::move(q)), settings(std::move(s)) {
 	}
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<JevChoiceBindData>(options);
+		return make_uniq<JevChoiceBindData>(question, settings);
 	}
 	bool Equals(const FunctionData &other) const override {
-		return options == other.Cast<JevChoiceBindData>().options;
+		auto &o = other.Cast<JevChoiceBindData>();
+		return question.criteria == o.question.criteria && settings.endpoint == o.settings.endpoint &&
+		       settings.model == o.settings.model;
+	}
+	//! Enum index of an option name, or -1 when the model answered off-list.
+	int64_t IndexOf(const string &option) const {
+		for (idx_t i = 0; i < question.criteria.size(); i++) {
+			if (question.criteria[i].first == option) {
+				return (int64_t)i;
+			}
+		}
+		return -1;
 	}
 };
 
@@ -54,7 +69,7 @@ static unique_ptr<FunctionData> JevChoiceBind(ClientContext &context, ScalarFunc
 		throw BinderException("jev_choice: at most 255 options, got %llu", (unsigned long long)entries.size());
 	}
 
-	vector<string> options;
+	JevChoiceQuestion question;
 	Vector ordered(LogicalType::VARCHAR, entries.size());
 	auto data = FlatVector::GetData<string_t>(ordered);
 	for (idx_t i = 0; i < entries.size(); i++) {
@@ -63,23 +78,37 @@ static unique_ptr<FunctionData> JevChoiceBind(ClientContext &context, ScalarFunc
 			throw BinderException("jev_choice: option name %llu is NULL", (unsigned long long)i);
 		}
 		auto name = kv[0].ToString();
-		options.push_back(name);
+		question.criteria.emplace_back(name, kv[1].IsNull() ? string() : kv[1].ToString());
 		data[i] = StringVector::AddString(ordered, name);
 	}
 	// Throws on duplicate option names; that is the behaviour we want.
 	bound_function.return_type = LogicalType::ENUM(ordered, entries.size());
-	return make_uniq<JevChoiceBindData>(std::move(options));
+	// Fail now, not at row one, when there is no secret to call the API with.
+	auto settings = ResolveJevSettings(context);
+	return make_uniq<JevChoiceBindData>(std::move(question), std::move(settings));
 }
 
-// SPIKE execution: no HTTP yet. Always answers with the first option so that the
-// type plumbing can be proven on its own.
+// One POST per row. The API carries exactly one state per request, so there is
+// no lever here other than asking several questions at once, which is a later slice.
 static void JevChoiceExec(DataChunk &args, ExpressionState &state, Vector &result) {
-	result.SetVectorType(VectorType::CONSTANT_VECTOR);
-	ConstantVector::GetData<uint8_t>(result)[0] = 0;
-	ConstantVector::SetNull(result, false);
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind = func_expr.bind_info->Cast<JevChoiceBindData>();
+	JevClient client(bind.settings);
+
+	UnaryExecutor::Execute<string_t, uint8_t>(args.data[0], result, args.size(), [&](string_t input) {
+		auto answer = client.AskChoice(input.GetString(), bind.question);
+		auto idx = bind.IndexOf(answer.choice);
+		if (idx < 0) {
+			// The model is constrained to the option set; reaching this means the
+			// service broke its contract. Surface it, do not coerce it.
+			throw IOException("jev_choice: the model answered '%s', which is not one of the options", answer.choice);
+		}
+		return (uint8_t)idx;
+	});
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	RegisterJevSecret(loader);
 	ScalarFunction jev_choice("jev_choice", {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)},
 	                          LogicalType::ANY, JevChoiceExec, JevChoiceBind);
 	// A network call is not a pure function. This also stops DuckDB folding it.

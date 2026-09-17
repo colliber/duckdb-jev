@@ -16,9 +16,9 @@ project(${TARGET_NAME})
 set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include_directories(src/include)
+include_directories(src/include duckdb/third_party/httplib duckdb/third_party/yyjson/include)
 
-set(EXTENSION_SOURCES src/jev_extension.cpp)
+set(EXTENSION_SOURCES src/jev_extension.cpp src/jev_secret.cpp src/jev_client.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
