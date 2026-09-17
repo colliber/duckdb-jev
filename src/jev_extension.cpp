@@ -31,8 +31,8 @@ struct JevChoiceBindData : public FunctionData {
 	}
 };
 
-static unique_ptr<FunctionData> JevChoiceBind(BindScalarFunctionInput &input) {
-	auto &args = input.GetArguments();
+static unique_ptr<FunctionData> JevChoiceBind(ClientContext &context, ScalarFunction &bound_function,
+                                              vector<unique_ptr<Expression>> &args) {
 	if (args.size() != 2) {
 		throw BinderException("jev_choice(state, criteria) takes exactly two arguments");
 	}
@@ -41,7 +41,7 @@ static unique_ptr<FunctionData> JevChoiceBind(BindScalarFunctionInput &input) {
 	if (!args[1]->IsFoldable()) {
 		throw BinderException("jev_choice: the criteria map must be a constant");
 	}
-	auto criteria = ExpressionExecutor::EvaluateScalar(input.GetClientContext(), *args[1]);
+	auto criteria = ExpressionExecutor::EvaluateScalar(context, *args[1]);
 	if (criteria.IsNull()) {
 		throw BinderException("jev_choice: the criteria map must not be NULL");
 	}
@@ -67,7 +67,7 @@ static unique_ptr<FunctionData> JevChoiceBind(BindScalarFunctionInput &input) {
 		data[i] = StringVector::AddString(ordered, name);
 	}
 	// Throws on duplicate option names; that is the behaviour we want.
-	input.GetBoundFunction().SetReturnType(LogicalType::ENUM(ordered, entries.size()));
+	bound_function.return_type = LogicalType::ENUM(ordered, entries.size());
 	return make_uniq<JevChoiceBindData>(std::move(options));
 }
 
@@ -83,7 +83,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction jev_choice("jev_choice", {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)},
 	                          LogicalType::ANY, JevChoiceExec, JevChoiceBind);
 	// A network call is not a pure function. This also stops DuckDB folding it.
-	jev_choice.SetStability(FunctionStability::VOLATILE);
+	jev_choice.stability = FunctionStability::VOLATILE;
 	loader.RegisterFunction(jev_choice);
 }
 
