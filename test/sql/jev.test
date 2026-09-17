@@ -1,6 +1,6 @@
 # name: test/sql/jev.test
 # description: bind-time behaviour of jev_choice. Nothing here reaches the network.
-# group: [jev]
+# group: [sql]
 
 require jev
 
