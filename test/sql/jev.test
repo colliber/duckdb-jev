@@ -97,3 +97,18 @@ statement error
 SELECT jev_ask('x', {mood: 'happy'});
 ----
 must be a MAP
+
+# jev_usage() reports what this process has spent: one row, four counters.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM jev_usage());
+----
+requests	BIGINT
+cache_hits	BIGINT
+input_tokens	BIGINT
+output_tokens	BIGINT
+
+# Nothing in this file reached the network, so nothing has been spent.
+query IIII
+SELECT * FROM jev_usage();
+----
+0	0	0	0

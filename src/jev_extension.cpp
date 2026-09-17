@@ -4,6 +4,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -402,6 +403,43 @@ static void JevAskExec(DataChunk &args, ExpressionState &state, Vector &result) 
 	});
 }
 
+//===--------------------------------------------------------------------===//
+// jev_usage() -> one row: requests, cache_hits, input_tokens, output_tokens
+//
+// A careless query over a large table is a large bill with no warning. This is
+// the warning: what the process has spent so far, summed from every response.
+//===--------------------------------------------------------------------===//
+struct JevUsageState : public GlobalTableFunctionState {
+	bool done = false;
+};
+
+static unique_ptr<FunctionData> JevUsageBind(ClientContext &context, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<string> &names) {
+	for (auto name : {"requests", "cache_hits", "input_tokens", "output_tokens"}) {
+		names.emplace_back(name);
+		return_types.emplace_back(LogicalType::BIGINT);
+	}
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> JevUsageInit(ClientContext &context, TableFunctionInitInput &input) {
+	return make_uniq<JevUsageState>();
+}
+
+static void JevUsageExec(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<JevUsageState>();
+	if (state.done) {
+		return;
+	}
+	state.done = true;
+	auto usage = JevClient::Usage();
+	output.SetValue(0, 0, Value::BIGINT(usage.requests));
+	output.SetValue(1, 0, Value::BIGINT(usage.cache_hits));
+	output.SetValue(2, 0, Value::BIGINT(usage.input_tokens));
+	output.SetValue(3, 0, Value::BIGINT(usage.output_tokens));
+	output.SetCardinality(1);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterJevSecret(loader);
 
@@ -427,6 +465,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 		fn->stability = FunctionStability::VOLATILE;
 		loader.RegisterFunction(*fn);
 	}
+
+	TableFunction jev_usage("jev_usage", {}, JevUsageExec, JevUsageBind, JevUsageInit);
+	loader.RegisterFunction(jev_usage);
 }
 
 void JevExtension::Load(ExtensionLoader &loader) {

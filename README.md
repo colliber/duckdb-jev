@@ -109,8 +109,12 @@ Shared by all three:
 
 - `SET jev_on_error = 'null'` turns a row whose request failed after its retries into
   `NULL` instead of failing the query. The default is `fail`.
+- `SELECT * FROM jev_usage()` reports what the process has spent so far: requests,
+  cache hits, and the input and output tokens the API charged. A careless query over
+  a large table is a large bill; this is the warning.
 
-Next: usage accounting, so a query reports the tokens it spent.
+Not yet: a build in the community extensions registry, a wasm target, a per-call
+`on_error`, and the answer probabilities as a `MAP` column.
 
 ## Tests
 
