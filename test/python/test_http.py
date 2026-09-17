@@ -20,11 +20,17 @@ RECORDED = {"model": "jev-1.13.0",
 requests = []
 
 DELAY = 0.0   # per-request latency the mock adds; set by a test
+FAIL_FIRST = []   # HTTP statuses to answer with before succeeding; consumed in order
 
 class Mock(BaseHTTPRequestHandler):
     def do_POST(self):
         if DELAY:
             time.sleep(DELAY)
+        if FAIL_FIRST:
+            status = FAIL_FIRST.pop(0)
+            requests.append({"path": self.path, "status": status})
+            self.send_response(status); self.send_header("Content-Length", "2"); self.end_headers()
+            self.wfile.write(b"{}"); return
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
         # answer with whichever option the state names, else the recorded answer
@@ -117,6 +123,35 @@ def test_rows_in_a_chunk_are_requested_concurrently(url):
     print(f"PASS concurrent_chunk: 16 rows at 200ms in {elapsed:.2f}s")
 
 
+def test_a_429_is_retried_with_backoff(url):
+    """The API documents 429 with no quota numbers: back off and retry. One 429 must
+    cost a short wait, not the query."""
+    global FAIL_FIRST
+    requests.clear(); FAIL_FIRST = [429]
+    rows = sql(url, """
+        CREATE TABLE t AS SELECT 'a refund please' AS body;
+        SELECT jev_choice(body, MAP{'refund':'r','bug':'b'}) AS intent FROM t;""")
+    assert rows == [{"intent": "refund"}], rows
+    statuses = [r.get("status", 200) for r in requests]
+    assert statuses == [429, 200], f"expected one 429 then a retry, got {statuses}"
+    print("PASS retry_429: one 429, one retry, answer delivered")
+
+
+def test_a_400_is_not_retried(url):
+    """A 4xx other than 429 means the request is wrong. Retrying cannot help; fail once."""
+    global FAIL_FIRST
+    requests.clear(); FAIL_FIRST = [400]
+    try:
+        sql(url, """SELECT jev_choice('x', MAP{'a':'1','b':'2'}) AS intent;""")
+        raise AssertionError("query should have failed on HTTP 400")
+    except AssertionError as e:
+        if "HTTP 400" not in str(e):
+            raise
+    statuses = [r.get("status", 200) for r in requests]
+    assert statuses == [400], f"expected exactly one attempt, got {statuses}"
+    print("PASS no_retry_400: one attempt, query failed with the status")
+
+
 def main():
     from http.server import ThreadingHTTPServer
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Mock)
@@ -124,7 +159,8 @@ def main():
     url = f"http://127.0.0.1:{srv.server_port}"
     failures = 0
     for test in (test_one_post_per_row, test_same_call_in_where_and_select_is_one_request_per_row,
-                 test_rows_in_a_chunk_are_requested_concurrently):
+                 test_rows_in_a_chunk_are_requested_concurrently,
+                 test_a_429_is_retried_with_backoff, test_a_400_is_not_retried):
         try:
             test(url)
         except AssertionError as e:

@@ -12,3 +12,6 @@ test/python/__pycache__/
 .jevenv
 *.key
 secrets/
+
+# editor / tooling caches
+.cache/
