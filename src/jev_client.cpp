@@ -4,6 +4,8 @@
 
 #include "jev_client.hpp"
 #include "duckdb/common/exception.hpp"
+#include <mutex>
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -12,6 +14,32 @@ using namespace duckdb_yyjson; // NOLINT
 static constexpr const char *SYSTEMONE_PATH = "/v1/systemone";
 //! The question key inside the request. One question per request in this slice.
 static constexpr const char *QUESTION_KEY = "q";
+//! Crude bound: when the cache reaches this many entries it is cleared. Enough for
+//! any single query to dedupe itself; not a persistent store.
+static constexpr size_t CACHE_MAX_ENTRIES = 100000;
+
+namespace {
+std::mutex cache_lock;
+std::unordered_map<string, string> cache;
+} // namespace
+
+bool JevClient::CacheGet(const string &key, string &body) {
+	std::lock_guard<std::mutex> guard(cache_lock);
+	auto it = cache.find(key);
+	if (it == cache.end()) {
+		return false;
+	}
+	body = it->second;
+	return true;
+}
+
+void JevClient::CachePut(const string &key, const string &body) {
+	std::lock_guard<std::mutex> guard(cache_lock);
+	if (cache.size() >= CACHE_MAX_ENTRIES) {
+		cache.clear();
+	}
+	cache[key] = body;
+}
 
 string JevClient::BuildChoiceRequest(const string &state, const JevChoiceQuestion &question) {
 	unique_ptr<yyjson_mut_doc, void (*)(yyjson_mut_doc *)> doc(yyjson_mut_doc_new(nullptr), &yyjson_mut_doc_free);
@@ -84,7 +112,16 @@ JevChoiceAnswer JevClient::ParseChoiceResponse(const string &body) {
 }
 
 JevChoiceAnswer JevClient::AskChoice(const string &state, const JevChoiceQuestion &question) {
-	return ParseChoiceResponse(Post(BuildChoiceRequest(state, question)));
+	auto request = BuildChoiceRequest(state, question);
+	// The request body already encodes state, model and criteria; add the endpoint
+	// so two services never share an answer.
+	auto key = settings.endpoint + "\x1f" + request;
+	string response;
+	if (!CacheGet(key, response)) {
+		response = Post(request);
+		CachePut(key, response);
+	}
+	return ParseChoiceResponse(response);
 }
 
 } // namespace duckdb
