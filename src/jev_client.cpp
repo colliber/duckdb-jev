@@ -5,6 +5,8 @@
 #include "jev_client.hpp"
 #include "duckdb/common/exception.hpp"
 #include <mutex>
+#include <chrono>
+#include <thread>
 #include <unordered_map>
 
 namespace duckdb {
@@ -17,6 +19,14 @@ static constexpr const char *QUESTION_KEY = "q";
 //! Crude bound: when the cache reaches this many entries it is cleared. Enough for
 //! any single query to dedupe itself; not a persistent store.
 static constexpr size_t CACHE_MAX_ENTRIES = 100000;
+//! Retry budget for 429 and 5xx. The API documents 429 with no quota numbers, so
+//! back off and try again. Other 4xx mean the request is wrong; retrying cannot help.
+static constexpr int MAX_ATTEMPTS = 4;
+static constexpr int FIRST_BACKOFF_MS = 200;
+
+static bool IsRetryable(int status) {
+	return status == 429 || (status >= 500 && status < 600);
+}
 
 namespace {
 std::mutex cache_lock;
@@ -79,15 +89,23 @@ string JevClient::Post(const string &body) {
 	duckdb_httplib_openssl::Headers headers;
 	headers.emplace("Authorization", "Bearer " + settings.api_key);
 
-	auto res = client.Post(SYSTEMONE_PATH, headers, body, "application/json");
-	if (!res) {
-		throw IOException("jev: request to %s failed: %s", settings.endpoint,
-		                  duckdb_httplib_openssl::to_string(res.error()));
+	int backoff_ms = FIRST_BACKOFF_MS;
+	for (int attempt = 1;; attempt++) {
+		auto res = client.Post(SYSTEMONE_PATH, headers, body, "application/json");
+		if (!res) {
+			throw IOException("jev: request to %s failed: %s", settings.endpoint,
+			                  duckdb_httplib_openssl::to_string(res.error()));
+		}
+		if (res->status == 200) {
+			return res->body;
+		}
+		if (!IsRetryable(res->status) || attempt >= MAX_ATTEMPTS) {
+			throw IOException("jev: HTTP %d from %s after %d attempt(s): %s", res->status, settings.endpoint, attempt,
+			                  res->body);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+		backoff_ms *= 2;
 	}
-	if (res->status != 200) {
-		throw IOException("jev: HTTP %d from %s: %s", res->status, settings.endpoint, res->body);
-	}
-	return res->body;
 }
 
 JevChoiceAnswer JevClient::ParseChoiceResponse(const string &body) {
