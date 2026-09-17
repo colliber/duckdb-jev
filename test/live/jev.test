@@ -1,0 +1,72 @@
+# name: test/live/jev.test
+# description: the extension against api.typesafe.ai. Pure SQL. Skipped unless
+# group: [live]
+
+#   TYPESAFE_API_KEY is set, so a checkout with no key still passes `make test`.
+#   Asserts the contract, not exact numbers: types, ranges, and three tickets
+#   whose class is not in doubt.
+
+require jev
+
+require-env TYPESAFE_API_KEY
+
+statement ok
+CREATE SECRET (TYPE jev, API_KEY '${TYPESAFE_API_KEY}');
+
+statement ok
+CREATE TABLE tickets AS SELECT * FROM (VALUES
+    (1, 'I want a refund for last month, the charge was wrong'),
+    (2, 'The export button crashes on large files'),
+    (3, 'Great product, the new dashboard is lovely')) v(id, body);
+
+# The column is a real ENUM and each ticket lands in the class it plainly belongs to.
+statement ok
+CREATE TABLE scored AS
+    SELECT id, jev_choice(body, MAP{
+        'refund': 'The customer wants money back',
+        'bug':    'The customer reports something broken',
+        'praise': 'The customer is complimenting the product'}) AS intent
+    FROM tickets;
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE scored) WHERE column_name = 'intent';
+----
+intent	ENUM('refund', 'bug', 'praise')
+
+query II
+SELECT id, intent FROM scored ORDER BY id;
+----
+1	refund
+2	bug
+3	praise
+
+# Score stays on its rubric, noul stays a probability.
+query I
+SELECT count(*) FROM tickets
+WHERE jev_score(body, ['trivial', 'minor', 'normal', 'serious', 'critical']) NOT BETWEEN 0 AND 4;
+----
+0
+
+query I
+SELECT count(*) FROM tickets
+WHERE jev_noul(body, MAP{'true': 'needs a reply today', 'false': 'can wait'}) NOT BETWEEN 0 AND 1;
+----
+0
+
+# jev_ask: one request per row, every field typed, confidence present.
+query I
+WITH asked AS (SELECT jev_ask(body, {
+        intent:   MAP{'refund': 'wants money back', 'bug': 'something broken', 'praise': 'a compliment'},
+        severity: ['trivial', 'minor', 'normal', 'serious', 'critical'],
+        urgent:   MAP{'true': 'needs a reply today', 'false': 'can wait'}}) AS a FROM tickets)
+SELECT count(*) FROM asked
+WHERE a.intent IS NULL OR a.intent_confidence NOT BETWEEN 0 AND 1
+   OR a.severity NOT BETWEEN 0 AND 4 OR a.urgent NOT BETWEEN 0 AND 1;
+----
+0
+
+# Something was spent, and the API reported it.
+query I
+SELECT requests > 0 AND input_tokens > 0 AND output_tokens > 0 FROM jev_usage();
+----
+true

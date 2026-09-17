@@ -1,0 +1,87 @@
+# Behaviour tests: everything the standard distribution pipeline does not cover.
+#
+# MainDistributionPipeline.yml is the DuckDB standard: it builds every platform and
+# runs the sqllogictests in test/sql with `make test`. It runs inside DuckDB's Docker
+# images, accepts no secrets of ours, and has no server that can fail on demand.
+# This workflow builds once on Linux and adds the two suites that need more:
+#
+#   make test_http   a mock endpoint that replays a recorded response and fails
+#                    when told to, so cache, retry, concurrency and on_error are
+#                    tested without spending a token
+#   make test_live   test/live/*.test against api.typesafe.ai, pure SQL,
+#                    skipped unless the TYPESAFE_API_KEY secret is set
+#
+# No key is stored here. Add TYPESAFE_API_KEY as a repository secret to turn the
+# live suite on; without it the suite reports itself skipped and the job passes.
+name: Behaviour tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: behaviour-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The vcpkg commit the distribution pipeline pins for this ci_tools_version.
+  VCPKG_COMMIT: 84bab45d415d22042bd0b9081aea57f362da3f35
+
+jobs:
+  behaviour:
+    name: Build once, run mock and live suites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ninja-build ccache
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-behaviour-${{ hashFiles('.gitmodules', 'CMakeLists.txt', 'vcpkg.json') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-behaviour-${{ hashFiles('.gitmodules', 'CMakeLists.txt', 'vcpkg.json') }}-
+            ccache-behaviour-
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/vcpkg
+            ~/.cache/vcpkg
+          key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: vcpkg
+        run: |
+          if [ ! -x ~/vcpkg/vcpkg ]; then
+            git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
+            git -C ~/vcpkg checkout "$VCPKG_COMMIT"
+            ~/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          fi
+          echo "VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: GEN=ninja make release
+
+      - name: sqllogictests
+        run: make test
+
+      - name: Mock endpoint suite
+        run: make test_http
+
+      - name: Live suite
+        run: make test_live
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
