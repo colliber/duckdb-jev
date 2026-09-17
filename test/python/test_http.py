@@ -52,10 +52,8 @@ CREATE SECRET (TYPE jev, API_KEY 'test-key-123', ENDPOINT '{server_url}');
             pos += 1
     return last
 
-def main():
-    srv = HTTPServer(("127.0.0.1", 0), Mock)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    url = f"http://127.0.0.1:{srv.server_port}"
+def test_one_post_per_row(url):
+    requests.clear()
 
     rows = sql(url, """
         CREATE TABLE t AS SELECT * FROM (VALUES
@@ -74,7 +72,40 @@ def main():
     q = req["body"]["questions"]["q"]
     assert q["type"] == "choice" and q["criteria"] == {
         "refund": "wants money back", "bug": "something broken", "praise": "a compliment"}, q
-    print("PASS: 3 rows, 3 POSTs, bearer header, verified request shape, enum answers")
+    print("PASS one_post_per_row: 3 rows, 3 POSTs, bearer header, request shape, enum answers")
+
+
+def test_same_call_in_where_and_select_is_one_request_per_row(url):
+    """DuckDB evaluates a volatile function once per occurrence. With the function in
+    both WHERE and SELECT that is two requests per row, and two bills. The extension
+    must answer the second occurrence from what it already knows."""
+    requests.clear()
+    rows = sql(url, """
+        CREATE TABLE t AS SELECT * FROM (VALUES
+            ('I want a refund, the charge was wrong'),
+            ('the export crashes, clearly a bug'),
+            ('lovely product, pure praise')) v(body);
+        SELECT body, jev_choice(body, MAP{'refund':'r','bug':'b','praise':'p'}) AS intent
+        FROM t
+        WHERE jev_choice(body, MAP{'refund':'r','bug':'b','praise':'p'}) <> 'praise'
+        ORDER BY body;""")
+    assert [r["intent"] for r in rows] == ["refund", "bug"], rows
+    assert len(requests) == 3, f"expected 3 requests for 3 rows, got {len(requests)}: paid twice"
+    print("PASS where_and_select: 3 rows, 3 requests, second evaluation served from cache")
+
+
+def main():
+    srv = HTTPServer(("127.0.0.1", 0), Mock)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}"
+    failures = 0
+    for test in (test_one_post_per_row, test_same_call_in_where_and_select_is_one_request_per_row):
+        try:
+            test(url)
+        except AssertionError as e:
+            failures += 1
+            print(f"FAIL {test.__name__}: {e}")
+    sys.exit(1 if failures else 0)
 
 if __name__ == "__main__":
     main()

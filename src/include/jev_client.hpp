@@ -26,6 +26,11 @@ public:
 
 private:
 	JevSettings settings;
+	//! Process-wide answer cache keyed on endpoint + request body. DuckDB evaluates a
+	//! volatile function once per occurrence, so the same row asked in WHERE and again
+	//! in SELECT would otherwise be two paid requests.
+	static bool CacheGet(const string &key, string &body);
+	static void CachePut(const string &key, const string &body);
 	string BuildChoiceRequest(const string &state, const JevChoiceQuestion &question);
 	string Post(const string &body);
 	JevChoiceAnswer ParseChoiceResponse(const string &body);
