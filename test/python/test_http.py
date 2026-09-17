@@ -14,7 +14,11 @@ EXT = os.path.join(ROOT, "build/release/extension/jev/jev.duckdb_extension")
 # Recorded 2026-09-17, model jev-1.13.0, state "I want a refund for last month..."
 RECORDED = {"model": "jev-1.13.0",
             "answers": {"intent": {"type": "choice", "choice": "refund", "confidence": 1.0,
-                                   "probabilities": {"refund": 1.0, "bug": 0.0, "praise": 0.0}}},
+                                   "probabilities": {"refund": 1.0, "bug": 0.0, "praise": 0.0}},
+                        "severity": {"type": "score", "score": 2.1, "confidence": 0.9,
+                                     "legend": {"0": "Trivial", "1": "Minor", "2": "Normal", "3": "Serious", "4": "Critical"},
+                                     "probabilities": {"0": 0.0, "1": 0.01, "2": 0.89, "3": 0.1, "4": 0.0}},
+                        "urgent": {"type": "noul", "noul": 0.6}},
             "usage": {"input_tokens": 412, "output_tokens": 69}}
 
 requests = []
@@ -33,12 +37,18 @@ class Mock(BaseHTTPRequestHandler):
             self.wfile.write(b"{}"); return
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
-        # answer with whichever option the state names, else the recorded answer
-        state = body["state"].lower()
-        opts = list(body["questions"]["q"]["criteria"].keys())
-        pick = next((o for o in opts if o in state), RECORDED["answers"]["intent"]["choice"])
+        q = body["questions"]["q"]
         resp = json.loads(json.dumps(RECORDED))
-        resp["answers"] = {"q": {**RECORDED["answers"]["intent"], "choice": pick}}
+        if q["type"] == "choice":
+            # answer with whichever option the state names, else the recorded answer
+            state = body["state"].lower()
+            opts = list(q["criteria"].keys())
+            pick = next((o for o in opts if o in state), RECORDED["answers"]["intent"]["choice"])
+            resp["answers"] = {"q": {**RECORDED["answers"]["intent"], "choice": pick}}
+        elif q["type"] == "score":
+            resp["answers"] = {"q": RECORDED["answers"]["severity"]}
+        else:
+            resp["answers"] = {"q": RECORDED["answers"]["urgent"]}
         out = json.dumps(resp).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
@@ -152,6 +162,20 @@ def test_a_400_is_not_retried(url):
     print("PASS no_retry_400: one attempt, query failed with the status")
 
 
+def test_score_and_noul_send_the_api_shape_and_return_doubles(url):
+    """Score criteria is an ordered list; noul criteria is an object with true/false.
+    Both verified against the served OpenAPI schema. Values from the recorded response."""
+    requests.clear()
+    rows = sql(url, """
+        SELECT jev_score('the export crashes', ['trivial','minor','normal','serious','critical']) AS severity,
+               jev_noul('the export crashes', MAP{'true':'needs a reply today','false':'can wait'}) AS p_urgent;""")
+    assert rows == [{"severity": 2.1, "p_urgent": 0.6}], rows
+    kinds = {r["body"]["questions"]["q"]["type"]: r["body"]["questions"]["q"] for r in requests}
+    assert kinds["score"]["criteria"] == ["trivial", "minor", "normal", "serious", "critical"], kinds["score"]
+    assert kinds["noul"]["criteria"] == {"true": "needs a reply today", "false": "can wait"}, kinds["noul"]
+    print("PASS score_and_noul: rubric as list, true/false as object, doubles 2.1 and 0.6")
+
+
 def main():
     from http.server import ThreadingHTTPServer
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Mock)
@@ -160,7 +184,8 @@ def main():
     failures = 0
     for test in (test_one_post_per_row, test_same_call_in_where_and_select_is_one_request_per_row,
                  test_rows_in_a_chunk_are_requested_concurrently,
-                 test_a_429_is_retried_with_backoff, test_a_400_is_not_retried):
+                 test_a_429_is_retried_with_backoff, test_a_400_is_not_retried,
+                 test_score_and_noul_send_the_api_shape_and_return_doubles):
         try:
             test(url)
         except AssertionError as e:

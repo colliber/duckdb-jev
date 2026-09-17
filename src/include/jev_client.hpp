@@ -4,16 +4,27 @@
 
 namespace duckdb {
 
-//! One Choice question: option -> description, exactly as the API's
-//! ChoiceQuestion.criteria expects it.
-struct JevChoiceQuestion {
-	vector<std::pair<string, string>> criteria;
+enum class JevQuestionType : uint8_t { CHOICE, SCORE, NOUL };
+
+//! One question, in the shape the API's Question schema expects:
+//!  choice: criteria is an object, option -> description
+//!  score:  criteria is an ordered array, the rubric
+//!  noul:   criteria is an object with the keys true and false
+struct JevQuestion {
+	JevQuestionType type = JevQuestionType::CHOICE;
+	vector<std::pair<string, string>> criteria_map; // choice, noul
+	vector<string> criteria_list;                   // score
+
+	bool operator==(const JevQuestion &o) const {
+		return type == o.type && criteria_map == o.criteria_map && criteria_list == o.criteria_list;
+	}
 };
 
-//! Answer to a Choice question.
-struct JevChoiceAnswer {
-	string choice;
-	double confidence = 0;
+//! The typed answer. Which field is set follows the question type.
+struct JevAnswer {
+	string choice;         // choice
+	double number = 0;     // score: the value on the rubric scale; noul: P(true)
+	double confidence = 0; // choice, score
 };
 
 //! Talks to POST {endpoint}/v1/systemone. One state per request.
@@ -21,8 +32,8 @@ class JevClient {
 public:
 	explicit JevClient(JevSettings settings) : settings(std::move(settings)) {
 	}
-	//! Ask one Choice question about one state. Throws on transport or protocol error.
-	JevChoiceAnswer AskChoice(const string &state, const JevChoiceQuestion &question);
+	//! Ask one question about one state. Throws on transport or protocol error.
+	JevAnswer Ask(const string &state, const JevQuestion &question);
 
 private:
 	JevSettings settings;
@@ -31,9 +42,9 @@ private:
 	//! in SELECT would otherwise be two paid requests.
 	static bool CacheGet(const string &key, string &body);
 	static void CachePut(const string &key, const string &body);
-	string BuildChoiceRequest(const string &state, const JevChoiceQuestion &question);
+	string BuildRequest(const string &state, const JevQuestion &question);
 	string Post(const string &body);
-	JevChoiceAnswer ParseChoiceResponse(const string &body);
+	JevAnswer ParseResponse(const string &body, JevQuestionType type);
 };
 
 } // namespace duckdb
