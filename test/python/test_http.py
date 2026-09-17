@@ -60,18 +60,14 @@ class Mock(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"{}")
             return
-        requests.append(
-            {"path": self.path, "auth": self.headers.get("Authorization"), "body": body}
-        )
+        requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
         q = body["questions"]["q"]
         resp = json.loads(json.dumps(RECORDED))
         if q["type"] == "choice":
             # answer with whichever option the state names, else the recorded answer
             state = body["state"].lower()
             opts = list(q["criteria"].keys())
-            pick = next(
-                (o for o in opts if o in state), RECORDED["answers"]["intent"]["choice"]
-            )
+            pick = next((o for o in opts if o in state), RECORDED["answers"]["intent"]["choice"])
             resp["answers"] = {"q": {**RECORDED["answers"]["intent"], "choice": pick}}
         elif q["type"] == "score":
             resp["answers"] = {"q": RECORDED["answers"]["severity"]}
@@ -94,9 +90,7 @@ LOAD '{EXT}';
 CREATE SECRET (TYPE jev, API_KEY 'test-key-123', ENDPOINT '{server_url}');
 {query}
 """
-    r = subprocess.run(
-        [DUCKDB, "-unsigned", "-json", "-c", script], capture_output=True, text=True
-    )
+    r = subprocess.run([DUCKDB, "-unsigned", "-json", "-c", script], capture_output=True, text=True)
     if r.returncode != 0:
         raise AssertionError(f"duckdb failed:\n{r.stderr}")
     # -json prints one array per statement that produces rows; keep the last.
@@ -135,9 +129,7 @@ def test_one_post_per_row(url):
         "bug": "something broken",
         "praise": "a compliment",
     }, q
-    print(
-        "PASS one_post_per_row: 3 rows, 3 POSTs, bearer header, request shape, enum answers"
-    )
+    print("PASS one_post_per_row: 3 rows, 3 POSTs, bearer header, request shape, enum answers")
 
 
 def test_same_call_in_where_and_select_is_one_request_per_row(url):
@@ -158,12 +150,8 @@ def test_same_call_in_where_and_select_is_one_request_per_row(url):
         ORDER BY body;""",
     )
     assert [r["intent"] for r in rows] == ["refund", "bug"], rows
-    assert (
-        len(requests) == 3
-    ), f"expected 3 requests for 3 rows, got {len(requests)}: paid twice"
-    print(
-        "PASS where_and_select: 3 rows, 3 requests, second evaluation served from cache"
-    )
+    assert len(requests) == 3, f"expected 3 requests for 3 rows, got {len(requests)}: paid twice"
+    print("PASS where_and_select: 3 rows, 3 requests, second evaluation served from cache")
 
 
 def test_rows_in_a_chunk_are_requested_concurrently(url):
@@ -185,9 +173,7 @@ def test_rows_in_a_chunk_are_requested_concurrently(url):
         DELAY = 0.0
     assert rows[0]["n"] == 16, rows
     assert len(requests) == 16, len(requests)
-    assert (
-        elapsed < 1.5
-    ), f"16 rows at 200ms took {elapsed:.2f}s: requests are sequential"
+    assert elapsed < 1.5, f"16 rows at 200ms took {elapsed:.2f}s: requests are sequential"
     print(f"PASS concurrent_chunk: 16 rows at 200ms in {elapsed:.2f}s")
 
 
@@ -237,10 +223,7 @@ def test_score_and_noul_send_the_api_shape_and_return_doubles(url):
                jev_noul('the export crashes', MAP{'true':'needs a reply today','false':'can wait'}) AS p_urgent;""",
     )
     assert rows == [{"severity": 2.1, "p_urgent": 0.6}], rows
-    kinds = {
-        r["body"]["questions"]["q"]["type"]: r["body"]["questions"]["q"]
-        for r in requests
-    }
+    kinds = {r["body"]["questions"]["q"]["type"]: r["body"]["questions"]["q"] for r in requests}
     assert kinds["score"]["criteria"] == [
         "trivial",
         "minor",
@@ -252,9 +235,7 @@ def test_score_and_noul_send_the_api_shape_and_return_doubles(url):
         "true": "needs a reply today",
         "false": "can wait",
     }, kinds["noul"]
-    print(
-        "PASS score_and_noul: rubric as list, true/false as object, doubles 2.1 and 0.6"
-    )
+    print("PASS score_and_noul: rubric as list, true/false as object, doubles 2.1 and 0.6")
 
 
 def test_on_error_null_turns_an_exhausted_row_into_null(url):
@@ -271,9 +252,7 @@ def test_on_error_null_turns_an_exhausted_row_into_null(url):
                 url,
                 """SELECT jev_choice('a bug report', MAP{'bug':'b','praise':'p'}) AS intent;""",
             )
-            raise AssertionError(
-                "default must fail the query after retries are exhausted"
-            )
+            raise AssertionError("default must fail the query after retries are exhausted")
         except AssertionError as e:
             if "HTTP 503" not in str(e):
                 raise
@@ -293,9 +272,7 @@ def test_on_error_null_turns_an_exhausted_row_into_null(url):
         {"body": "a bug report", "intent": None},
         {"body": "pure praise", "intent": "praise"},
     ], rows
-    print(
-        "PASS on_error_null: exhausted row is NULL after 4 attempts, the other row is answered"
-    )
+    print("PASS on_error_null: exhausted row is NULL after 4 attempts, the other row is answered")
 
 
 def test_on_error_rejects_unknown_modes(url):
