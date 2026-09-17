@@ -26,7 +26,13 @@ RECORDED = {
             "type": "score",
             "score": 2.1,
             "confidence": 0.9,
-            "legend": {"0": "Trivial", "1": "Minor", "2": "Normal", "3": "Serious", "4": "Critical"},
+            "legend": {
+                "0": "Trivial",
+                "1": "Minor",
+                "2": "Normal",
+                "3": "Serious",
+                "4": "Critical",
+            },
             "probabilities": {"0": 0.0, "1": 0.01, "2": 0.89, "3": 0.1, "4": 0.0},
         },
         "urgent": {"type": "noul", "noul": 0.6},
@@ -38,29 +44,34 @@ requests = []
 
 DELAY = 0.0  # per-request latency the mock adds; set by a test
 FAIL_FIRST = []  # HTTP statuses to answer with before succeeding; consumed in order
+ALWAYS_FAIL = {}  # state text -> HTTP status; every request for that state fails
 
 
 class Mock(BaseHTTPRequestHandler):
     def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if DELAY:
             time.sleep(DELAY)
-        if FAIL_FIRST:
-            status = FAIL_FIRST.pop(0)
+        if FAIL_FIRST or body["state"] in ALWAYS_FAIL:
+            status = FAIL_FIRST.pop(0) if FAIL_FIRST else ALWAYS_FAIL[body["state"]]
             requests.append({"path": self.path, "status": status})
             self.send_response(status)
             self.send_header("Content-Length", "2")
             self.end_headers()
             self.wfile.write(b"{}")
             return
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
+        requests.append(
+            {"path": self.path, "auth": self.headers.get("Authorization"), "body": body}
+        )
         q = body["questions"]["q"]
         resp = json.loads(json.dumps(RECORDED))
         if q["type"] == "choice":
             # answer with whichever option the state names, else the recorded answer
             state = body["state"].lower()
             opts = list(q["criteria"].keys())
-            pick = next((o for o in opts if o in state), RECORDED["answers"]["intent"]["choice"])
+            pick = next(
+                (o for o in opts if o in state), RECORDED["answers"]["intent"]["choice"]
+            )
             resp["answers"] = {"q": {**RECORDED["answers"]["intent"], "choice": pick}}
         elif q["type"] == "score":
             resp["answers"] = {"q": RECORDED["answers"]["severity"]}
@@ -83,7 +94,9 @@ LOAD '{EXT}';
 CREATE SECRET (TYPE jev, API_KEY 'test-key-123', ENDPOINT '{server_url}');
 {query}
 """
-    r = subprocess.run([DUCKDB, "-unsigned", "-json", "-c", script], capture_output=True, text=True)
+    r = subprocess.run(
+        [DUCKDB, "-unsigned", "-json", "-c", script], capture_output=True, text=True
+    )
     if r.returncode != 0:
         raise AssertionError(f"duckdb failed:\n{r.stderr}")
     # -json prints one array per statement that produces rows; keep the last.
@@ -122,7 +135,9 @@ def test_one_post_per_row(url):
         "bug": "something broken",
         "praise": "a compliment",
     }, q
-    print("PASS one_post_per_row: 3 rows, 3 POSTs, bearer header, request shape, enum answers")
+    print(
+        "PASS one_post_per_row: 3 rows, 3 POSTs, bearer header, request shape, enum answers"
+    )
 
 
 def test_same_call_in_where_and_select_is_one_request_per_row(url):
@@ -143,8 +158,12 @@ def test_same_call_in_where_and_select_is_one_request_per_row(url):
         ORDER BY body;""",
     )
     assert [r["intent"] for r in rows] == ["refund", "bug"], rows
-    assert len(requests) == 3, f"expected 3 requests for 3 rows, got {len(requests)}: paid twice"
-    print("PASS where_and_select: 3 rows, 3 requests, second evaluation served from cache")
+    assert (
+        len(requests) == 3
+    ), f"expected 3 requests for 3 rows, got {len(requests)}: paid twice"
+    print(
+        "PASS where_and_select: 3 rows, 3 requests, second evaluation served from cache"
+    )
 
 
 def test_rows_in_a_chunk_are_requested_concurrently(url):
@@ -166,7 +185,9 @@ def test_rows_in_a_chunk_are_requested_concurrently(url):
         DELAY = 0.0
     assert rows[0]["n"] == 16, rows
     assert len(requests) == 16, len(requests)
-    assert elapsed < 1.5, f"16 rows at 200ms took {elapsed:.2f}s: requests are sequential"
+    assert (
+        elapsed < 1.5
+    ), f"16 rows at 200ms took {elapsed:.2f}s: requests are sequential"
     print(f"PASS concurrent_chunk: 16 rows at 200ms in {elapsed:.2f}s")
 
 
@@ -206,7 +227,8 @@ def test_a_400_is_not_retried(url):
 
 def test_score_and_noul_send_the_api_shape_and_return_doubles(url):
     """Score criteria is an ordered list; noul criteria is an object with true/false.
-    Both verified against the served OpenAPI schema. Values from the recorded response."""
+    Both verified against the served OpenAPI schema. Values from the recorded response.
+    """
     requests.clear()
     rows = sql(
         url,
@@ -215,10 +237,75 @@ def test_score_and_noul_send_the_api_shape_and_return_doubles(url):
                jev_noul('the export crashes', MAP{'true':'needs a reply today','false':'can wait'}) AS p_urgent;""",
     )
     assert rows == [{"severity": 2.1, "p_urgent": 0.6}], rows
-    kinds = {r["body"]["questions"]["q"]["type"]: r["body"]["questions"]["q"] for r in requests}
-    assert kinds["score"]["criteria"] == ["trivial", "minor", "normal", "serious", "critical"], kinds["score"]
-    assert kinds["noul"]["criteria"] == {"true": "needs a reply today", "false": "can wait"}, kinds["noul"]
-    print("PASS score_and_noul: rubric as list, true/false as object, doubles 2.1 and 0.6")
+    kinds = {
+        r["body"]["questions"]["q"]["type"]: r["body"]["questions"]["q"]
+        for r in requests
+    }
+    assert kinds["score"]["criteria"] == [
+        "trivial",
+        "minor",
+        "normal",
+        "serious",
+        "critical",
+    ], kinds["score"]
+    assert kinds["noul"]["criteria"] == {
+        "true": "needs a reply today",
+        "false": "can wait",
+    }, kinds["noul"]
+    print(
+        "PASS score_and_noul: rubric as list, true/false as object, doubles 2.1 and 0.6"
+    )
+
+
+def test_on_error_null_turns_an_exhausted_row_into_null(url):
+    """Default: a row that exhausts its retries fails the query. With
+    SET jev_on_error = 'null' it becomes NULL and the other rows still arrive.
+    The mock fails by state, so exactly one row exhausts its budget however the
+    rows are scheduled."""
+    global ALWAYS_FAIL
+    requests.clear()
+    ALWAYS_FAIL = {"a bug report": 503}
+    try:
+        try:
+            sql(
+                url,
+                """SELECT jev_choice('a bug report', MAP{'bug':'b','praise':'p'}) AS intent;""",
+            )
+            raise AssertionError(
+                "default must fail the query after retries are exhausted"
+            )
+        except AssertionError as e:
+            if "HTTP 503" not in str(e):
+                raise
+        attempts = sum(1 for r in requests if r.get("status") == 503)
+        assert attempts == 4, f"expected the retry budget of 4 attempts, got {attempts}"
+        requests.clear()
+        rows = sql(
+            url,
+            """
+            SET jev_on_error = 'null';
+            CREATE TABLE t AS SELECT * FROM (VALUES ('a bug report'), ('pure praise')) v(body);
+            SELECT body, jev_choice(body, MAP{'bug':'b','praise':'p'}) AS intent FROM t ORDER BY body;""",
+        )
+    finally:
+        ALWAYS_FAIL = {}
+    assert rows == [
+        {"body": "a bug report", "intent": None},
+        {"body": "pure praise", "intent": "praise"},
+    ], rows
+    print(
+        "PASS on_error_null: exhausted row is NULL after 4 attempts, the other row is answered"
+    )
+
+
+def test_on_error_rejects_unknown_modes(url):
+    try:
+        sql(url, """SET jev_on_error = 'shrug'; SELECT 1;""")
+        raise AssertionError("an unknown mode must be rejected when set")
+    except AssertionError as e:
+        if "jev_on_error" not in str(e):
+            raise
+    print("PASS on_error_validation: unknown mode rejected at SET")
 
 
 def main():
@@ -235,6 +322,8 @@ def main():
         test_a_429_is_retried_with_backoff,
         test_a_400_is_not_retried,
         test_score_and_noul_send_the_api_shape_and_return_doubles,
+        test_on_error_null_turns_an_exhausted_row_into_null,
+        test_on_error_rejects_unknown_modes,
     ):
         try:
             test(url)
