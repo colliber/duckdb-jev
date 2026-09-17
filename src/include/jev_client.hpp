@@ -32,6 +32,15 @@ using JevQuestions = vector<std::pair<string, JevQuestion>>;
 //! Answers by question name.
 using JevAnswers = unordered_map<string, JevAnswer>;
 
+//! What this process has spent on Jev so far. Summed from every response's usage
+//! block; answers served from the cache add to cache_hits and nothing else.
+struct JevUsage {
+	int64_t requests = 0;
+	int64_t cache_hits = 0;
+	int64_t input_tokens = 0;
+	int64_t output_tokens = 0;
+};
+
 //! Talks to POST {endpoint}/v1/systemone. One state per request, any number of
 //! questions: that is the only lever the API offers on cost and latency.
 class JevClient {
@@ -42,6 +51,8 @@ public:
 	JevAnswer Ask(const string &state, const JevQuestion &question);
 	//! Ask several named questions about one state in a single request.
 	JevAnswers Ask(const string &state, const JevQuestions &questions);
+	//! A snapshot of the process-wide counters.
+	static JevUsage Usage();
 
 private:
 	JevSettings settings;

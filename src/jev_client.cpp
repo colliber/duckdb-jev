@@ -5,6 +5,7 @@
 #include "jev_client.hpp"
 #include "duckdb/common/exception.hpp"
 #include <mutex>
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <unordered_map>
@@ -31,7 +32,38 @@ static bool IsRetryable(int status) {
 namespace {
 std::mutex cache_lock;
 std::unordered_map<string, string> cache;
+std::atomic<int64_t> usage_requests(0), usage_cache_hits(0), usage_input_tokens(0), usage_output_tokens(0);
 } // namespace
+
+JevUsage JevClient::Usage() {
+	JevUsage u;
+	u.requests = usage_requests.load();
+	u.cache_hits = usage_cache_hits.load();
+	u.input_tokens = usage_input_tokens.load();
+	u.output_tokens = usage_output_tokens.load();
+	return u;
+}
+
+//! Adds a fresh response's usage block to the counters. Missing or malformed usage
+//! is not an error: the answer is still good, the bill is just unknown for it.
+static void RecordUsage(const string &body) {
+	unique_ptr<yyjson_doc, void (*)(yyjson_doc *)> doc(yyjson_read(body.c_str(), body.size(), 0), &yyjson_doc_free);
+	if (!doc) {
+		return;
+	}
+	auto usage = yyjson_obj_get(yyjson_doc_get_root(doc.get()), "usage");
+	if (!usage) {
+		return;
+	}
+	auto in = yyjson_obj_get(usage, "input_tokens");
+	auto out = yyjson_obj_get(usage, "output_tokens");
+	if (in && yyjson_is_int(in)) {
+		usage_input_tokens += yyjson_get_sint(in);
+	}
+	if (out && yyjson_is_int(out)) {
+		usage_output_tokens += yyjson_get_sint(out);
+	}
+}
 
 bool JevClient::CacheGet(const string &key, string &body) {
 	std::lock_guard<std::mutex> guard(cache_lock);
@@ -179,8 +211,12 @@ JevAnswers JevClient::Ask(const string &state, const JevQuestions &questions) {
 	// endpoint so two services never share an answer.
 	auto key = settings.endpoint + "\x1f" + request;
 	string response;
-	if (!CacheGet(key, response)) {
+	if (CacheGet(key, response)) {
+		usage_cache_hits++;
+	} else {
 		response = Post(request);
+		usage_requests++;
+		RecordUsage(response);
 		CachePut(key, response);
 	}
 	return ParseResponse(response, questions);

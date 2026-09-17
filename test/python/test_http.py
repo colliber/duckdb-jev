@@ -338,6 +338,34 @@ def test_ask_is_one_request_with_every_question(url):
     print("PASS ask_one_request: 3 questions, 1 POST, typed struct from the recorded answers")
 
 
+def test_usage_reports_requests_and_tokens(url):
+    """A careless query over a large table is a large bill with no warning. jev_usage()
+    reports what this process has spent: requests made, answers served from cache,
+    and the tokens the API charged, summed from every response's usage block."""
+    requests.clear()
+    rows = sql(
+        url,
+        """
+        CREATE TABLE t AS SELECT * FROM (VALUES ('a refund'), ('a bug'), ('praise')) v(body);
+        CREATE TABLE scored AS
+            SELECT body, jev_choice(body, MAP{'refund':'r','bug':'b','praise':'p'}) AS intent FROM t;
+        -- the same three states again: served from cache, no new tokens
+        CREATE TABLE again AS
+            SELECT body, jev_choice(body, MAP{'refund':'r','bug':'b','praise':'p'}) AS intent FROM t;
+        SELECT requests, cache_hits, input_tokens, output_tokens FROM jev_usage();""",
+    )
+    # every recorded response carries usage {input_tokens: 412, output_tokens: 69}
+    assert rows == [
+        {
+            "requests": 3,
+            "cache_hits": 3,
+            "input_tokens": 3 * 412,
+            "output_tokens": 3 * 69,
+        }
+    ], rows
+    print("PASS usage: 3 requests, 3 cache hits, 1236 input and 207 output tokens")
+
+
 def main():
     from http.server import ThreadingHTTPServer
 
@@ -355,6 +383,7 @@ def main():
         test_on_error_null_turns_an_exhausted_row_into_null,
         test_on_error_rejects_unknown_modes,
         test_ask_is_one_request_with_every_question,
+        test_usage_reports_requests_and_tokens,
     ):
         try:
             test(url)
