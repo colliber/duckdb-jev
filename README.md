@@ -68,13 +68,29 @@ A real response, for the ticket "I want a refund for last month, the charge was 
 
 ## Status
 
-**Spike.** `jev_choice` proves the bind-time `ENUM` return type. Execution is
-stubbed and makes no network call yet.
+Working, one function. `jev_choice` proves the design end to end against the live
+API:
 
-Next, in order: the HTTP client and a secret type, a per-chunk thread pool, a
-response cache (DuckDB evaluates the same call twice when it appears in both
-`WHERE` and `SELECT`, and that is not going to be fixed), and `jev_ask` returning a
-struct so many questions cost one call.
+- `CREATE SECRET (TYPE jev, API_KEY '...')`, with optional `ENDPOINT` and `MODEL`.
+  No secret is a bind error, not a row-one failure.
+- One POST per row, the API's floor. Rows within a chunk go out concurrently:
+  16 rows at 200 ms each take 0.36 s, not 3.3 s.
+- An answer cache keyed on the request. DuckDB evaluates a volatile function once
+  per occurrence, so the same call in `WHERE` and `SELECT` was two bills per row.
+  Now one.
+
+Next, in order: retry with backoff on 429, `jev_score` and `jev_noul`, an
+`on_error` mode (fail, null, capture), `jev_ask` returning a struct so many
+questions cost one call, and usage accounting.
+
+## Tests
+
+Two suites, both at the SQL seam:
+
+```sh
+make test                          # bind-time behaviour, no network
+python3 test/python/test_http.py   # a mock endpoint replaying a recorded response
+```
 
 ## Building
 

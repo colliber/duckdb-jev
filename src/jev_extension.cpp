@@ -7,6 +7,8 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include <thread>
+#include <atomic>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include "jev_secret.hpp"
 #include "jev_client.hpp"
@@ -88,23 +90,83 @@ static unique_ptr<FunctionData> JevChoiceBind(ClientContext &context, ScalarFunc
 	return make_uniq<JevChoiceBindData>(std::move(question), std::move(settings));
 }
 
-// One POST per row. The API carries exactly one state per request, so there is
-// no lever here other than asking several questions at once, which is a later slice.
+// One POST per row is the API's floor: a request carries exactly one state. But the
+// rows of a chunk are independent, so they are requested concurrently rather than
+// waited for in turn. The pool is per chunk and bounded; DuckDB may already be
+// running several chunks on several threads.
+static constexpr idx_t MAX_CONCURRENT_REQUESTS = 16;
+
 static void JevChoiceExec(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &bind = func_expr.bind_info->Cast<JevChoiceBindData>();
-	JevClient client(bind.settings);
+	auto count = args.size();
 
-	UnaryExecutor::Execute<string_t, uint8_t>(args.data[0], result, args.size(), [&](string_t input) {
-		auto answer = client.AskChoice(input.GetString(), bind.question);
-		auto idx = bind.IndexOf(answer.choice);
-		if (idx < 0) {
-			// The model is constrained to the option set; reaching this means the
-			// service broke its contract. Surface it, do not coerce it.
-			throw IOException("jev_choice: the model answered '%s', which is not one of the options", answer.choice);
+	UnifiedVectorFormat input;
+	args.data[0].ToUnifiedFormat(count, input);
+	auto input_data = UnifiedVectorFormat::GetData<string_t>(input);
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto out = FlatVector::GetData<uint8_t>(result);
+	auto &out_validity = FlatVector::Validity(result);
+
+	// Gather the rows that need a request. NULL in, NULL out, no request.
+	vector<idx_t> pending;
+	pending.reserve(count);
+	for (idx_t row = 0; row < count; row++) {
+		auto idx = input.sel->get_index(row);
+		if (input.validity.RowIsValid(idx)) {
+			pending.push_back(row);
+		} else {
+			out_validity.SetInvalid(row);
 		}
-		return (uint8_t)idx;
-	});
+	}
+
+	JevClient client(bind.settings);
+	std::atomic<idx_t> next(0);
+	std::mutex error_lock;
+	string first_error;
+
+	auto worker = [&]() {
+		while (true) {
+			auto i = next.fetch_add(1);
+			if (i >= pending.size()) {
+				return;
+			}
+			auto row = pending[i];
+			auto idx = input.sel->get_index(row);
+			try {
+				auto answer = client.AskChoice(input_data[idx].GetString(), bind.question);
+				auto option = bind.IndexOf(answer.choice);
+				if (option < 0) {
+					// The model is constrained to the option set; reaching this means the
+					// service broke its contract. Surface it, do not coerce it.
+					throw IOException("jev_choice: the model answered '%s', which is not one of the options",
+					                  answer.choice);
+				}
+				out[row] = (uint8_t)option;
+			} catch (std::exception &ex) {
+				std::lock_guard<std::mutex> guard(error_lock);
+				if (first_error.empty()) {
+					first_error = ex.what();
+				}
+			}
+		}
+	};
+
+	auto workers = MinValue<idx_t>(MAX_CONCURRENT_REQUESTS, pending.size());
+	vector<std::thread> pool;
+	for (idx_t i = 1; i < workers; i++) {
+		pool.emplace_back(worker);
+	}
+	if (workers > 0) {
+		worker(); // this thread pulls its share too
+	}
+	for (auto &t : pool) {
+		t.join();
+	}
+	if (!first_error.empty()) {
+		throw IOException("%s", first_error);
+	}
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
