@@ -24,10 +24,10 @@ JEV_EXTENSION ?= ./build/release/extension/jev/jev.duckdb_extension
 test_http:
 	DUCKDB_BIN=$(DUCKDB_BIN) JEV_EXTENSION=$(JEV_EXTENSION) python3 test/python/test_http.py
 
-# The unittest runner registers tests by walking the directory named before `*`,
-# the same way the standard target names test/. Live tests get their own directory
-# so they can be run alone; `make test` walks test/ and still includes them.
+# The runner registers tests by their path relative to the project, tagged with the
+# directory name, so test/live/jev.test is `test/live/jev.test [live]`. Filter the
+# same way the standard target filters "test/*".
 test_live:
-	./build/release/$(TEST_PATH) "$(PROJ_DIR)test/live/*"
+	./build/release/$(TEST_PATH) "test/live/*"
 
 test_all: test test_http test_live
