@@ -19,17 +19,48 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // Bind data shared by every function: the question, and where to send it.
 //===--------------------------------------------------------------------===//
+//! What to do with a row whose request failed after its retries.
+enum class JevOnError : uint8_t { FAIL, NULL_ROW };
+
+static constexpr const char *ON_ERROR_SETTING = "jev_on_error";
+
+static JevOnError ParseOnError(const string &mode) {
+	auto lower = StringUtil::Lower(mode);
+	if (lower == "fail") {
+		return JevOnError::FAIL;
+	}
+	if (lower == "null") {
+		return JevOnError::NULL_ROW;
+	}
+	throw InvalidInputException("%s must be 'fail' or 'null', got '%s'", ON_ERROR_SETTING, mode);
+}
+
+static void ValidateOnError(ClientContext &context, SetScope scope, Value &parameter) {
+	ParseOnError(parameter.ToString());
+}
+
+static JevOnError CurrentOnError(ClientContext &context) {
+	Value v;
+	if (context.TryGetCurrentSetting(ON_ERROR_SETTING, v) && !v.IsNull()) {
+		return ParseOnError(v.ToString());
+	}
+	return JevOnError::FAIL;
+}
+
 struct JevBindData : public FunctionData {
 	JevQuestion question;
 	JevSettings settings;
-	JevBindData(JevQuestion q, JevSettings s) : question(std::move(q)), settings(std::move(s)) {
+	JevOnError on_error;
+	JevBindData(JevQuestion q, JevSettings s, JevOnError e)
+	    : question(std::move(q)), settings(std::move(s)), on_error(e) {
 	}
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<JevBindData>(question, settings);
+		return make_uniq<JevBindData>(question, settings, on_error);
 	}
 	bool Equals(const FunctionData &other) const override {
 		auto &o = other.Cast<JevBindData>();
-		return question == o.question && settings.endpoint == o.settings.endpoint && settings.model == o.settings.model;
+		return question == o.question && settings.endpoint == o.settings.endpoint &&
+		       settings.model == o.settings.model && on_error == o.on_error;
 	}
 	//! Enum index of an option name, or -1 when the model answered off-list.
 	int64_t IndexOf(const string &option) const {
@@ -100,7 +131,7 @@ static unique_ptr<FunctionData> JevChoiceBind(ClientContext &context, ScalarFunc
 	bound_function.return_type = LogicalType::ENUM(ordered, question.criteria_map.size());
 	// Fail now, not at row one, when there is no secret to call the API with.
 	auto settings = ResolveJevSettings(context);
-	return make_uniq<JevBindData>(std::move(question), std::move(settings));
+	return make_uniq<JevBindData>(std::move(question), std::move(settings), CurrentOnError(context));
 }
 
 //===--------------------------------------------------------------------===//
@@ -121,7 +152,7 @@ static unique_ptr<FunctionData> JevScoreBind(ClientContext &context, ScalarFunct
 		throw BinderException("jev_score: the rubric needs at least two levels to be a scale");
 	}
 	auto settings = ResolveJevSettings(context);
-	return make_uniq<JevBindData>(std::move(question), std::move(settings));
+	return make_uniq<JevBindData>(std::move(question), std::move(settings), CurrentOnError(context));
 }
 
 //===--------------------------------------------------------------------===//
@@ -142,7 +173,7 @@ static unique_ptr<FunctionData> JevNoulBind(ClientContext &context, ScalarFuncti
 		}
 	}
 	auto settings = ResolveJevSettings(context);
-	return make_uniq<JevBindData>(std::move(question), std::move(settings));
+	return make_uniq<JevBindData>(std::move(question), std::move(settings), CurrentOnError(context));
 }
 
 //===--------------------------------------------------------------------===//
@@ -196,6 +227,13 @@ static void JevExecConcurrent(DataChunk &args, ExpressionState &state, Vector &r
 				auto answer = client.Ask(input_data[idx].GetString(), bind.question);
 				out[row] = write(bind, answer);
 			} catch (std::exception &ex) {
+				if (bind.on_error == JevOnError::NULL_ROW) {
+					// The row is lost, the query is not. Validity writes are per-row
+					// bit flips on a shared mask, so serialise them.
+					std::lock_guard<std::mutex> guard(error_lock);
+					out_validity.SetInvalid(row);
+					continue;
+				}
 				std::lock_guard<std::mutex> guard(error_lock);
 				if (first_error.empty()) {
 					first_error = ex.what();
@@ -239,6 +277,12 @@ static void JevNumberExec(DataChunk &args, ExpressionState &state, Vector &resul
 
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterJevSecret(loader);
+
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	config.AddExtensionOption(ON_ERROR_SETTING,
+	                          "What to do with a row whose Jev request failed after retries: 'fail' the query "
+	                          "(default) or return 'null' for that row",
+	                          LogicalType::VARCHAR, Value("fail"), ValidateOnError);
 
 	auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 
