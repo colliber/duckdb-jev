@@ -141,13 +141,15 @@ test HTTP behaviour made the same choice.
 
 ## CI
 
-Two workflows.
+Two jobs on a pull request, one build. `ci.yml` runs the DuckDB format check, which
+needs no build, and one Linux build followed by `make test`, `make test_http` and
+`make test_live`. The live suite turns on when a `TYPESAFE_API_KEY` repository
+secret exists and reports itself skipped otherwise.
 
-- `MainDistributionPipeline.yml` is the DuckDB standard, unchanged: every platform,
-  `make test`, clang-format, clang-tidy.
-- `behaviour.yml` builds once on Linux and runs `make test_http` and `make test_live`.
-  The live suite turns on when a `TYPESAFE_API_KEY` repository secret exists and
-  reports itself skipped otherwise.
+The DuckDB standard distribution pipeline, twelve platforms plus clang-tidy, is
+release-grade and runs on `main`, on `v*` tags, and on demand. Trigger it on a
+branch from the Actions tab before merging anything that touches the build or
+platform-specific code.
 
 ## Building
 
