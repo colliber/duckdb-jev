@@ -44,17 +44,22 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
+      # Shallow everywhere. The duckdb submodule alone carries years of history that
+      # a build never reads.
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Toolchain
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q ninja-build ccache
-          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
           echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=2G" >> "$GITHUB_ENV"
+          # Compiler-invocation hashes only, so a fresh checkout path still hits.
+          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros" >> "$GITHUB_ENV"
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -76,14 +81,26 @@ jobs:
       - name: vcpkg
         run: |
           if [ ! -x ~/vcpkg/vcpkg ]; then
-            git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
-            git -C ~/vcpkg checkout "$VCPKG_COMMIT"
+            # fetch exactly the pinned commit, not the whole registry history
+            git init -q ~/vcpkg
+            git -C ~/vcpkg fetch -q --depth 1 https://github.com/microsoft/vcpkg.git "$VCPKG_COMMIT"
+            git -C ~/vcpkg checkout -q FETCH_HEAD
             ~/vcpkg/bootstrap-vcpkg.sh -disableMetrics
           fi
           echo "VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
 
+      # EXT_FLAGS is the ci-tools makefile's hook into the cmake invocation. Putting
+      # ccache on PATH is not enough: the build names its compilers explicitly, so
+      # the launcher has to be passed to cmake. Without this the cold build is
+      # 34 minutes and the cache saves nothing.
       - name: Build
-        run: GEN=ninja make release
+        run: |
+          GEN=ninja EXT_FLAGS="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache" \
+            make release
+
+      # Shows whether the cache did its job. A warm run should be mostly hits.
+      - name: ccache statistics
+        run: ccache -s
 
       - name: sqllogictests
         run: make test

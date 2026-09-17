@@ -6,7 +6,7 @@ so the expected values come from the actual service, not from this test.
 """
 
 import json, os, subprocess, sys, threading, time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DUCKDB = os.environ.get("DUCKDB_BIN") or os.path.join(ROOT, "build/release/duckdb")
@@ -45,6 +45,7 @@ requests = []
 DELAY = 0.0  # per-request latency the mock adds; set by a test
 FAIL_FIRST = []  # HTTP statuses to answer with before succeeding; consumed in order
 ALWAYS_FAIL = {}  # state text -> HTTP status; every request for that state fails
+DROP_NEXT = [0]  # how many connections to drop without answering at all
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -52,6 +53,11 @@ class Mock(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if DELAY:
             time.sleep(DELAY)
+        if DROP_NEXT[0] > 0:
+            DROP_NEXT[0] -= 1
+            requests.append({"path": self.path, "status": "dropped"})
+            self.close_connection = True
+            return
         if FAIL_FIRST or body["state"] in ALWAYS_FAIL:
             status = FAIL_FIRST.pop(0) if FAIL_FIRST else ALWAYS_FAIL[body["state"]]
             requests.append({"path": self.path, "status": status})
@@ -211,6 +217,25 @@ def test_a_429_is_retried_with_backoff(url):
     print("PASS retry_429: one 429, one retry, answer delivered")
 
 
+def test_a_dropped_connection_is_retried(url):
+    """A connection closed before any status is exactly as transient as a 503:
+    a proxy recycling, a keep-alive expiring, a server restarting. The answer is
+    already paid for by then, so retry rather than fail the query."""
+    requests.clear()
+    DROP_NEXT[0] = 1
+    try:
+        rows = sql(
+            url,
+            """SELECT jev_choice('a refund please', MAP{'refund':'r','bug':'b'}) AS intent;""",
+        )
+    finally:
+        DROP_NEXT[0] = 0
+    assert rows == [{"intent": "refund"}], rows
+    kinds = [r.get("status", 200) for r in requests]
+    assert kinds == ["dropped", 200], f"expected one drop then a retry, got {kinds}"
+    print("PASS retry_dropped_connection: one drop, one retry, answer delivered")
+
+
 def test_a_400_is_not_retried(url):
     """A 4xx other than 429 means the request is wrong. Retrying cannot help; fail once."""
     global FAIL_FIRST
@@ -366,10 +391,17 @@ def test_usage_reports_requests_and_tokens(url):
     print("PASS usage: 3 requests, 3 cache hits, 1236 input and 207 output tokens")
 
 
-def main():
-    from http.server import ThreadingHTTPServer
+class MockServer(ThreadingHTTPServer):
+    # socketserver defaults to a backlog of 5. The extension opens up to 16
+    # connections at once, so on a slow machine the rest are refused before the
+    # accept loop drains. That is a property of this mock, not of the extension.
+    request_queue_size = 64
+    daemon_threads = True
+    allow_reuse_address = True
 
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), Mock)
+
+def main():
+    srv = MockServer(("127.0.0.1", 0), Mock)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{srv.server_port}"
     failures = 0
@@ -378,6 +410,7 @@ def main():
         test_same_call_in_where_and_select_is_one_request_per_row,
         test_rows_in_a_chunk_are_requested_concurrently,
         test_a_429_is_retried_with_backoff,
+        test_a_dropped_connection_is_retried,
         test_a_400_is_not_retried,
         test_score_and_noul_send_the_api_shape_and_return_doubles,
         test_on_error_null_turns_an_exhausted_row_into_null,

@@ -146,14 +146,17 @@ string JevClient::Post(const string &body) {
 	int backoff_ms = FIRST_BACKOFF_MS;
 	for (int attempt = 1;; attempt++) {
 		auto res = client.Post(SYSTEMONE_PATH, headers, body, "application/json");
-		if (!res) {
-			throw IOException("jev: request to %s failed: %s", settings.endpoint,
-			                  duckdb_httplib_openssl::to_string(res.error()));
-		}
-		if (res->status == 200) {
+		if (res && res->status == 200) {
 			return res->body;
 		}
-		if (!IsRetryable(res->status) || attempt >= MAX_ATTEMPTS) {
+		// A connection closed before any status is as transient as a 503: a proxy
+		// recycling, a keep-alive expiring, a server restarting. Retry both.
+		auto retryable = !res || IsRetryable(res->status);
+		if (!retryable || attempt >= MAX_ATTEMPTS) {
+			if (!res) {
+				throw IOException("jev: request to %s failed after %d attempt(s): %s", settings.endpoint, attempt,
+				                  duckdb_httplib_openssl::to_string(res.error()));
+			}
 			throw IOException("jev: HTTP %d from %s after %d attempt(s): %s", res->status, settings.endpoint, attempt,
 			                  res->body);
 		}
