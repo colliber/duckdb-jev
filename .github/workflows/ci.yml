@@ -19,6 +19,12 @@ name: CI
 
 on:
   pull_request:
+    # A markdown change cannot break a build or a test. Nothing here inspects
+    # documentation, so run nothing for it.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
