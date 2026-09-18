@@ -3,13 +3,27 @@
 A DuckDB extension that asks [Jev](https://typesafe.ai) a typed question about every
 row, and returns the answer as a **real SQL type**.
 
-```sql
-SELECT jev_choice(body, MAP{
-    'refund': 'The customer wants money back',
-    'bug':    'The customer reports something broken',
-    'praise': 'The customer is complimenting the product'
-}) AS intent
-FROM tickets;
+```console
+D CREATE SECRET (TYPE jev, API_KEY 'sk-...');
+D CREATE TABLE tickets AS SELECT * FROM (VALUES
+      (1, 'I want a refund for last month, the charge was wrong'),
+      (2, 'The export button crashes on files over 100MB'),
+      (3, 'Great product, the new dashboard is lovely')) t(id, body);
+
+D SELECT id, jev_choice(body, MAP{
+      'refund': 'The customer wants money back',
+      'bug':    'The customer reports something broken',
+      'praise': 'The customer is complimenting the product'
+  }) AS intent
+  FROM tickets;
+┌───────┬─────────────────────────────────┐
+│  id   │             intent              │
+│ int32 │ enum('refund', 'bug', 'praise') │
+├───────┼─────────────────────────────────┤
+│     1 │ refund                          │
+│     2 │ bug                             │
+│     3 │ praise                          │
+└───────┴─────────────────────────────────┘
 ```
 
 `intent` is an `ENUM('refund', 'bug', 'praise')`. Not a `VARCHAR` you cast and hope.
@@ -66,9 +80,7 @@ A real response, for the ticket "I want a refund for last month, the charge was 
  "usage":{"input_tokens":412,"output_tokens":69}}
 ```
 
-## Status
-
-Working, four functions, each checked end to end against the live API:
+## Functions
 
 | Function | Criteria | Returns |
 |---|---|---|
