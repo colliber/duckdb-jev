@@ -23,6 +23,9 @@ on:
     # documentation, so run nothing for it.
     paths-ignore:
       - '**.md'
+      - '**.gif'
+      - '**.png'
+      - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
   workflow_dispatch:

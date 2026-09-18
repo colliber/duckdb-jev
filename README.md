@@ -2,6 +2,8 @@
 
 Ask a question about every row of a table, in SQL, and get a real SQL type back.
 
+![duckdb-jev in the DuckDB shell](docs/demo.gif)
+
 ```console
 D CREATE TABLE tickets AS SELECT * FROM (VALUES
       (1, 'I want a refund for last month, the charge was wrong'),
