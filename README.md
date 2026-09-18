@@ -1,6 +1,6 @@
 # duckdb-jev
 
-Ask a question about every row of a table, in SQL, and get back a real SQL type.
+Ask a question about every row of a table, in SQL, and get a real SQL type back.
 
 ```console
 D CREATE TABLE tickets AS SELECT * FROM (VALUES
@@ -24,108 +24,66 @@ D SELECT id, jev_choice(body, MAP{
 └───────┴─────────────────────────────────┘
 ```
 
-`intent` is an `ENUM`, not a `VARCHAR` you cast and hope. You can `GROUP BY` it,
-join on it, and put it in a column that rejects anything else.
+`intent` is an `ENUM`, not a `VARCHAR` you cast and hope. A DuckDB extension over
+[Jev](https://typesafe.ai), TypeSafe's model for typed answers instead of text.
 
-That table is three literal rows so you can paste the example, but it could just as
-easily have been `SELECT * FROM 'support/*.parquet'` or a table in Postgres. The
-point is that the question is asked where the data already is.
+## Why
 
-This is a DuckDB extension over [Jev](https://typesafe.ai), a model from TypeSafe
-that answers typed questions instead of generating text.
+The data you want to ask about is already in a table or a Parquet file. The usual
+route pulls it out, wraps an API in a script, parses the reply and writes it back.
+SQL is the query language everyone already has and DuckDB reads the formats the data
+already lives in, so ask the question where the data is.
 
-## Why bother
-
-Most of what you would want to ask a model about is already sitting in a table, a
-Parquet file, or an object store. Today the usual route is to pull it out, write a
-script around an API, parse what comes back, and put it somewhere else. That is a
-lot of moving parts for what is really a projection.
-
-SQL is the one query language everybody already has, and DuckDB reads the formats
-the data already lives in. So the shortest path from a question to an answer is to
-ask it where the data is, rather than moving the data to where the asking happens.
-That is the whole idea here: context comes straight from the source.
-
-### The type safety is not the exciting part
-
-Typed output is nice, and it is what you notice first. But on its own I do not find
-it compelling. There is still a network call in the middle, so I already need
-retries for the small fraction that fails for boring reasons. If a model returned a
-value outside my enum, I would handle it in the same place, the same way. And
-models keep getting better at that: schema mistakes are a shrinking problem, not a
-growing one.
-
-### The exciting part is what the constraint bought
-
-The interesting move is that TypeSafe did not trade anything away for the type
-guarantee. They added it, and in doing so got to change how the answer is produced
-at all. In their words, Jev "outputs all probabilities in parallel instead of
-autoregressively generating by token."
-
-That is the whole thing in one sentence. A model writing a sentence must produce it
-one token at a time, each conditioned on the last, because it does not know where it
-is going. A model choosing among five known options does not have that problem, and
-so does not need that machinery. Constraining the output is what made a different
-sampler possible. The type safety is not a feature bolted onto a language model; it
-is the premise that let the architecture be rebuilt.
-
-Here is what that looks like from outside, measured against the live API:
+Typed output alone would not be worth an extension. There is a network call either
+way, so retries exist regardless, and models are getting better at schemas, not
+worse. The interesting part is what the constraint bought. Jev "outputs all
+probabilities in parallel instead of autoregressively generating by token". A model
+writing a sentence emits one token at a time because it does not know where it is
+going. A model choosing among five known options does not have that problem, so it
+does not need that machinery.
 
 | | Server-side time |
 |---|---|
 | One question about a row | 49 to 104 ms |
 | Three questions about the same row | 53 to 91 ms |
 
-Two things stand out. It answers in well under a tenth of a second. And asking three
-questions costs about what asking one costs, so the work is not proportional to how
-much you ask, which is not how generating text behaves.
+Under a tenth of a second, and three questions cost what one costs. Work is not
+proportional to how much you ask, which is not how generating text behaves. Being
+typed is what made it fast enough to run per row, and a classification you can
+afford per row changes what you would attempt in SQL at all.
 
-That is the reason this extension exists. Not that the answer is well typed, but
-that being well typed is what let it get fast enough to sit in the middle of a query
-over a whole table. A classification you can afford to run per row changes what you
-would attempt in SQL at all.
-
-*How that was measured, so you can disagree with it: from Amsterdam against
-`api.typesafe.ai`, model `jev-1.13.0`, reading the service's own processing-time
-header rather than wall clock. End to end I see about 700 ms per call, nearly all of
-it network round trip. TypeSafe themselves claim 70 to 500 ms end to end and, on
-their [launch post](https://typesafe.ai/blog/introducing-system-one-models-and-jev),
-40 to 200 times faster than frontier models. That comparison is their own in-house
-evaluation against the non-reasoning modes of two models they chose, and the post
-calls its own headline figures "on the higher end of real world gains." Nobody has
-published an independent benchmark either way. Treat their multiplier as a claim and
-the table above as one person's measurement.*
+*Measured from Amsterdam against `api.typesafe.ai`, model `jev-1.13.0`, reading the
+service's own processing-time header. End to end I see ~700 ms, nearly all network.
+TypeSafe [claim](https://typesafe.ai/blog/introducing-system-one-models-and-jev) 40
+to 200 times faster than frontier models, from their own evaluation against
+non-reasoning baselines they chose, which their post calls "the higher end of real
+world gains". Nobody has published an independent benchmark.*
 
 ## Using it
-
-Every function takes the row's text first and a **criteria** literal second. The
-criteria does two jobs at once: it tells the model which answers are permitted, and
-it decides the SQL type of the column. That is why the two can never drift apart. It
-has to be a constant, because a type must be known before the query runs.
 
 ```console
 D CREATE SECRET (TYPE jev, API_KEY 'sk-...');
 ```
 
-`ENDPOINT` and `MODEL` are optional. With no secret, a query fails when it is
-planned rather than part-way through.
+`ENDPOINT` and `MODEL` are optional. With no secret, queries fail when planned
+rather than part-way through.
 
-| Call | Criteria you write | Column you get |
+Each function takes the row's text, then a **criteria** literal. The criteria tells
+the model which answers are permitted and decides the column's type, which is why
+they cannot drift apart, and why it must be constant.
+
+| Call | Criteria | Column |
 |---|---|---|
 | `jev_choice(text, MAP{option: meaning})` | what each option means | `ENUM` of those options |
 | `jev_score(text, [worst, ..., best])` | an ordered rubric | `DOUBLE` on that scale |
-| `jev_noul(text, MAP{'true': …, 'false': …})` | what yes and no mean | `DOUBLE`, the probability of yes |
-| `jev_ask(text, {name: criteria, …})` | any mix of the three | `STRUCT`, one field per question |
+| `jev_noul(text, MAP{'true': …, 'false': …})` | what yes and no mean | `DOUBLE`, probability of yes |
+| `jev_ask(text, {name: criteria, …})` | any mix | `STRUCT`, one field per question |
 
-Those descriptions are not decoration. They are how the model is told what each
-option means, so a good one reads like an instruction to a colleague.
+The descriptions are how the model is told what an option means. Write them like an
+instruction to a colleague.
 
-### Ask everything at once
-
-Since three questions cost about what one costs, ask them together. `jev_ask` sends
-them in a single request and gives you a struct back. Each field takes its type from
-the shape you wrote, and choice and score fields carry a `<name>_confidence` beside
-them.
+Since three questions cost what one costs, ask them together. Fields take their type
+from the criteria shape; choice and score get a `<name>_confidence` beside them.
 
 ```console
 D WITH asked AS (
@@ -147,23 +105,17 @@ D WITH asked AS (
 └───────┴─────────────────────────────────┴──────────┴────────┘
 ```
 
-Mistakes are caught when the query is planned, not on row four hundred thousand: an
-empty option map, a duplicate option, a rubric with one level, more than 255
-options, or a criteria that is not constant.
+An empty option map, a duplicate option, a one-level rubric, over 255 options or a
+non-constant criteria all fail when the query is planned, not on row 400,000.
 
-### What a query costs
+### Cost
 
-One request per row is the floor, so treat these like a join against a paid service
-rather than like `upper()`. Three things soften that, none of which need
-configuring:
-
-- Rows in a chunk go out **concurrently**, sixteen at a time.
-- Identical requests are **cached** for the life of the process. This matters more
-  than it sounds: DuckDB evaluates a function once per place it appears, so the same
-  call in `WHERE` and in `SELECT` would otherwise be billed twice per row.
-- Rate limits, server errors and dropped connections are **retried** with backoff,
-  four attempts. Anything else fails immediately, since retrying a malformed request
-  cannot help.
+One request per row, so treat these like a join against a paid service. Rows in a
+chunk go out sixteen at a time. Identical requests are cached for the life of the
+process, which matters because DuckDB evaluates a function once per place it
+appears, so the same call in `WHERE` and `SELECT` would bill twice per row. Rate
+limits, server errors and dropped connections retry with backoff; anything else
+fails at once.
 
 ```console
 D SELECT * FROM jev_usage();
@@ -175,17 +127,15 @@ D SELECT * FROM jev_usage();
 └──────────┴────────────┴──────────────┴───────────────┘
 ```
 
-A row that still fails after its retries fails the query. If you would rather lose
-the row than the query, `SET jev_on_error = 'null'` puts `NULL` in that cell and
-carries on.
+`SET jev_on_error = 'null'` loses the row instead of the query.
 
-## Where this is going
+## Next
 
-- A **playground** you can open in a browser, with a few tables to poke at, so the
-  idea can be tried without an install or a key.
-- **Autocomplete while you write**, suggesting options from the table's own schema,
-  so composing one of these queries is a matter of picking rather than typing.
-- Publishing to the DuckDB community registry, so installing is one line.
+- **Batching.** One request can carry many rows: 100 tickets classified correctly in
+  a single call, 129 ms, a third of the tokens per row. Not wired up yet.
+- **A playground**, so the idea can be tried without an install or a key.
+- **Autocomplete** that suggests options from the table's own schema.
+- Publishing to the DuckDB community registry.
 
 ## Licence
 
