@@ -10,6 +10,10 @@ python3 synth.py     # builds demo.cast from those outputs
 ./togif.sh           # agg: demo.cast -> demo.gif
 ```
 
+The SQL is highlighted with Pygments, the same lexer editors use, so keywords,
+strings and functions read differently. Table borders are dimmed and headers
+brightened, so the eye lands on the data rather than the box.
+
 `steps.py` is the script of the demo: the SQL shown, how long to hold each result,
 and whether a step is meant to fail.
 
