@@ -10,28 +10,13 @@ and hope.
 
 ## Why
 
-The data you want to ask about already sits in a table or a Parquet file, SQL is the
-query language everyone has, and DuckDB reads the formats the data lives in, so ask
-the question where the data is. Typed output alone would not be worth an extension:
-there is a network call either way, so retries exist regardless, and models are
-getting better at schemas rather than worse. What matters is what the constraint
-bought. Jev "outputs all probabilities in parallel instead of autoregressively
-generating by token", so a model choosing among five known options skips the
-machinery a model writing a sentence needs. Three questions about a row cost what
-one costs, and none of it takes a tenth of a second. Being typed is what made it
-cheap enough to run per row, and a classification you can afford per row changes
-what you would attempt in SQL at all.
-
-| | Server-side time |
-|---|---|
-| One question about a row | 49 to 104 ms |
-| Three questions about the same row | 53 to 91 ms |
-
-*Measured from Amsterdam against `api.typesafe.ai`, model `jev-1.13.0`, reading the
-service's own processing-time header; end to end I see ~700 ms, nearly all network.
-TypeSafe [claim](https://typesafe.ai/blog/introducing-system-one-models-and-jev) 40
-to 200 times faster than frontier models, from their own evaluation against
-non-reasoning baselines they chose. Nobody has published an independent benchmark.*
+The data you want to ask about already sits in a table or a Parquet file, and SQL is
+the query language everyone has. So ask the question where the data is, instead of
+pulling it out, wrapping an API in a script and writing the answer back. That only
+works if asking is cheap, and it is: Jev picks from a set you define rather than
+generating text, so it skips the machinery that makes a language model expensive.
+Asking something of every row stops being a thing you budget for and becomes a thing
+you write.
 
 ## Using it
 
