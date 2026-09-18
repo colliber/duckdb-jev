@@ -12,11 +12,13 @@ and hope.
 
 The data you want to ask about already sits in a table or a Parquet file, and SQL is
 the query language everyone has. So ask the question where the data is, instead of
-pulling it out, wrapping an API in a script and writing the answer back. That only
-works if asking is cheap, and it is: Jev picks from a set you define rather than
-generating text, so it skips the machinery that makes a language model expensive.
-Asking something of every row stops being a thing you budget for and becomes a thing
-you write.
+pulling it out, wrapping an API in a script and writing the answer back.
+
+That only works if asking is cheap, and this is where Jev earns its place. It does
+not write an answer and leave you to check the shape: it picks from the set you
+define, so the result is typed by construction rather than by validation. Not
+generating is also what makes it cheap, and cheap is what lets you ask something of
+every row instead of budgeting for it.
 
 ## Using it
 
