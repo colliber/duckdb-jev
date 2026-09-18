@@ -1,10 +1,8 @@
 # duckdb-jev
 
-A DuckDB extension that asks [Jev](https://typesafe.ai) a typed question about every
-row, and returns the answer as a **real SQL type**.
+Ask a question about every row of a table, in SQL, and get back a real SQL type.
 
 ```console
-D CREATE SECRET (TYPE jev, API_KEY 'sk-...');
 D CREATE TABLE tickets AS SELECT * FROM (VALUES
       (1, 'I want a refund for last month, the charge was wrong'),
       (2, 'The export button crashes on files over 100MB'),
@@ -26,48 +24,80 @@ D SELECT id, jev_choice(body, MAP{
 └───────┴─────────────────────────────────┘
 ```
 
-`intent` is an `ENUM('refund', 'bug', 'praise')`. Not a `VARCHAR` you cast and hope.
+`intent` is an `ENUM`, not a `VARCHAR` you cast and hope. You can `GROUP BY` it,
+join on it, and put it in a column that rejects anything else.
 
-## Why this is not another LLM-in-SQL extension
+That table is three literal rows so you can paste the example, but it could just as
+easily have been `SELECT * FROM 'support/*.parquet'` or a table in Postgres. The
+point is that the question is asked where the data already is.
 
-Every existing extension in this space returns text. You cast it, and the cast
-fails partway through a query you have already paid for:
+This is a DuckDB extension over [Jev](https://typesafe.ai), a model from TypeSafe
+that answers typed questions instead of generating text.
 
-```
-Conversion Error: Could not convert string 'Sure! Based on the ticket,
-I'd say: praise.' to UINT8
-```
+## Why bother
 
-Three things stack here to make that impossible:
+Most of what you would want to ask a model about is already sitting in a table, a
+Parquet file, or an object store. Today the usual route is to pull it out, write a
+script around an API, parse what comes back, and put it somewhere else. That is a
+lot of moving parts for what is really a projection.
 
-1. **The model cannot produce an off-list answer.** Jev takes the option set as a
-   request parameter, not as a wish expressed in a prompt. Chat-completions APIs
-   have no equivalent, which is why no existing extension can reach this endpoint
-   by pointing a base URL at it.
-2. **The return type is built from the same map.** The extension reads the criteria
-   map during *bind* and constructs the `ENUM` from its keys, so the column type and
-   the model's option set cannot drift apart.
-3. **Mistakes fail at bind time.** An empty map, a duplicate option, more than 255
-   options, or a non-constant map are rejected before a single API call is made.
+SQL is the one query language everybody already has, and DuckDB reads the formats
+the data already lives in. So the shortest path from a question to an answer is to
+ask it where the data is, rather than moving the data to where the asking happens.
+That is the whole idea here: context comes straight from the source.
 
-What this does **not** claim: that the answer is correct. Strict typing guarantees
-the value is in the set and the column has the right type. A wrong answer is still
-wrong.
+### The type safety is not the exciting part
 
-## Asking a question
+Typed output is nice, and it is what you notice first. But on its own I do not find
+it compelling. There is still a network call in the middle, so I already need
+retries for the small fraction that fails for boring reasons. If a model returned a
+value outside my enum, I would handle it in the same place, the same way. And
+models keep getting better at that: schema mistakes are a shrinking problem, not a
+growing one.
 
-Every function takes the row's text as its first argument and a **criteria**
-literal as its second. The criteria does two jobs at once: it is sent to the model
-as the set of permitted answers, and it decides the SQL type that comes back. That
-is why the two can never disagree. It must be a constant, because a type has to be
-known before the query runs.
+### The exciting part is what the constraint bought
+
+The interesting move is that TypeSafe did not trade anything away for the type
+guarantee. They added it, and in doing so got to rebuild the architecture around a
+much smaller job. A model that must emit one of five options does not have to
+generate a sentence, or a JSON object, or anything it might then have to be checked
+against. It has to pick. That is a different shape of problem, and it can be
+answered in a different way.
+
+Here is what that looks like from the outside, measured against the live API:
+
+| | Server-side time |
+|---|---|
+| One question about a row | 49 to 104 ms |
+| Three questions about the same row | 53 to 91 ms |
+
+Two things stand out. The first is that it answers in well under a tenth of a
+second. The second is stranger and more telling: asking three questions costs
+essentially the same as asking one. The work is not proportional to how much you
+ask, which is not how generating text behaves.
+
+That is the real innovation, and the reason this extension exists. Not that the
+answer is well typed, but that being well typed is what let it get fast enough to
+put in the middle of a query over a whole table. A classification you can afford to
+run per row changes what you would even attempt in SQL.
+
+*(Latency measured from Amsterdam against `api.typesafe.ai`, model `jev-1.13.0`,
+reading the service's own processing time rather than wall clock. End to end I see
+about 700 ms per call, nearly all of it network round trip.)*
+
+## Using it
+
+Every function takes the row's text first and a **criteria** literal second. The
+criteria does two jobs at once: it tells the model which answers are permitted, and
+it decides the SQL type of the column. That is why the two can never drift apart. It
+has to be a constant, because a type must be known before the query runs.
 
 ```console
 D CREATE SECRET (TYPE jev, API_KEY 'sk-...');
 ```
 
-`ENDPOINT` and `MODEL` are optional. Without a secret, a query fails when it is
-planned rather than on its first row.
+`ENDPOINT` and `MODEL` are optional. With no secret, a query fails when it is
+planned rather than part-way through.
 
 | Call | Criteria you write | Column you get |
 |---|---|---|
@@ -76,20 +106,15 @@ planned rather than on its first row.
 | `jev_noul(text, MAP{'true': …, 'false': …})` | what yes and no mean | `DOUBLE`, the probability of yes |
 | `jev_ask(text, {name: criteria, …})` | any mix of the three | `STRUCT`, one field per question |
 
-The descriptions are not decoration. They are how the model is told what each
-option means, so a useful one reads like an instruction to a colleague.
+Those descriptions are not decoration. They are how the model is told what each
+option means, so a good one reads like an instruction to a colleague.
 
 ### Ask everything at once
 
-The API charges per piece of text, not per question, and carries only one piece of
-text per request. So three questions asked separately cost three requests, and
-`jev_ask` asks all three in one. Prefer it whenever you want more than one answer
-about a row.
-
-Each field's type follows the shape you wrote: a map becomes an `ENUM`, a list
-becomes a `DOUBLE` on the rubric, and a map keyed `true`/`false` becomes a
-probability. Choice and score fields get a `<name>_confidence` beside them, which
-the model derives from its own answer distribution.
+Since three questions cost about what one costs, ask them together. `jev_ask` sends
+them in a single request and gives you a struct back. Each field takes its type from
+the shape you wrote, and choice and score fields carry a `<name>_confidence` beside
+them.
 
 ```console
 D WITH asked AS (
@@ -111,21 +136,23 @@ D WITH asked AS (
 └───────┴─────────────────────────────────┴──────────┴────────┘
 ```
 
+Mistakes are caught when the query is planned, not on row four hundred thousand: an
+empty option map, a duplicate option, a rubric with one level, more than 255
+options, or a criteria that is not constant.
+
 ### What a query costs
 
-One request per row is the floor, so treat these functions like a join against a
-paid service rather than like `upper()`. Three things soften it, and none of them
-need configuring:
+One request per row is the floor, so treat these like a join against a paid service
+rather than like `upper()`. Three things soften that, none of which need
+configuring:
 
-- Rows in a chunk are requested **concurrently**, sixteen at a time.
+- Rows in a chunk go out **concurrently**, sixteen at a time.
 - Identical requests are **cached** for the life of the process. This matters more
   than it sounds: DuckDB evaluates a function once per place it appears, so the same
   call in `WHERE` and in `SELECT` would otherwise be billed twice per row.
 - Rate limits, server errors and dropped connections are **retried** with backoff,
-  four attempts. Any other error fails the query immediately, because retrying a
-  malformed request cannot help.
-
-Watch the bill as you go:
+  four attempts. Anything else fails immediately, since retrying a malformed request
+  cannot help.
 
 ```console
 D SELECT * FROM jev_usage();
@@ -137,12 +164,17 @@ D SELECT * FROM jev_usage();
 └──────────┴────────────┴──────────────┴───────────────┘
 ```
 
-A row that still fails after its retries fails the whole query. If you would rather
-lose the row than the query, `SET jev_on_error = 'null'` puts `NULL` in that cell
-and carries on.
+A row that still fails after its retries fails the query. If you would rather lose
+the row than the query, `SET jev_on_error = 'null'` puts `NULL` in that cell and
+carries on.
 
-Not yet: a published build in the DuckDB community registry, a wasm target, a
-per-call error mode, and the full answer distribution as a `MAP` column.
+## Where this is going
+
+- A **playground** you can open in a browser, with a few tables to poke at, so the
+  idea can be tried without an install or a key.
+- **Autocomplete while you write**, suggesting options from the table's own schema,
+  so composing one of these queries is a matter of picking rather than typing.
+- Publishing to the DuckDB community registry, so installing is one line.
 
 ## Licence
 
