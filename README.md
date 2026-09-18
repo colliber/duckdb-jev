@@ -1,162 +1,141 @@
 # duckdb-jev
 
-A DuckDB extension that asks [Jev](https://typesafe.ai) a typed question about every
-row, and returns the answer as a **real SQL type**.
+Ask a question about every row of a table, in SQL, and get a real SQL type back.
 
-```sql
-SELECT jev_choice(body, MAP{
-    'refund': 'The customer wants money back',
-    'bug':    'The customer reports something broken',
-    'praise': 'The customer is complimenting the product'
-}) AS intent
-FROM tickets;
+```console
+D CREATE TABLE tickets AS SELECT * FROM (VALUES
+      (1, 'I want a refund for last month, the charge was wrong'),
+      (2, 'The export button crashes on files over 100MB'),
+      (3, 'Great product, the new dashboard is lovely')) t(id, body);
+
+D SELECT id, jev_choice(body, MAP{
+      'refund': 'The customer wants money back',
+      'bug':    'The customer reports something broken',
+      'praise': 'The customer is complimenting the product'
+  }) AS intent
+  FROM tickets;
+┌───────┬─────────────────────────────────┐
+│  id   │             intent              │
+│ int32 │ enum('refund', 'bug', 'praise') │
+├───────┼─────────────────────────────────┤
+│     1 │ refund                          │
+│     2 │ bug                             │
+│     3 │ praise                          │
+└───────┴─────────────────────────────────┘
 ```
 
-`intent` is an `ENUM('refund', 'bug', 'praise')`. Not a `VARCHAR` you cast and hope.
+`intent` is an `ENUM`, not a `VARCHAR` you cast and hope. A DuckDB extension over
+[Jev](https://typesafe.ai), TypeSafe's model for typed answers instead of text.
 
-## Why this is not another LLM-in-SQL extension
+## Why
 
-Every existing extension in this space returns text. You cast it, and the cast
-fails partway through a query you have already paid for:
+The data you want to ask about is already in a table or a Parquet file. The usual
+route pulls it out, wraps an API in a script, parses the reply and writes it back.
+SQL is the query language everyone already has and DuckDB reads the formats the data
+already lives in, so ask the question where the data is.
 
+Typed output alone would not be worth an extension. There is a network call either
+way, so retries exist regardless, and models are getting better at schemas, not
+worse. The interesting part is what the constraint bought. Jev "outputs all
+probabilities in parallel instead of autoregressively generating by token". A model
+writing a sentence emits one token at a time because it does not know where it is
+going. A model choosing among five known options does not have that problem, so it
+does not need that machinery.
+
+| | Server-side time |
+|---|---|
+| One question about a row | 49 to 104 ms |
+| Three questions about the same row | 53 to 91 ms |
+
+Under a tenth of a second, and three questions cost what one costs. Work is not
+proportional to how much you ask, which is not how generating text behaves. Being
+typed is what made it fast enough to run per row, and a classification you can
+afford per row changes what you would attempt in SQL at all.
+
+*Measured from Amsterdam against `api.typesafe.ai`, model `jev-1.13.0`, reading the
+service's own processing-time header. End to end I see ~700 ms, nearly all network.
+TypeSafe [claim](https://typesafe.ai/blog/introducing-system-one-models-and-jev) 40
+to 200 times faster than frontier models, from their own evaluation against
+non-reasoning baselines they chose, which their post calls "the higher end of real
+world gains". Nobody has published an independent benchmark.*
+
+## Using it
+
+```console
+D CREATE SECRET (TYPE jev, API_KEY 'sk-...');
 ```
-Conversion Error: Could not convert string 'Sure! Based on the ticket,
-I'd say: praise.' to UINT8
-```
 
-Three things stack here to make that impossible:
+`ENDPOINT` and `MODEL` are optional. With no secret, queries fail when planned
+rather than part-way through.
 
-1. **The model cannot produce an off-list answer.** Jev takes the option set as a
-   request parameter, not as a wish expressed in a prompt. Chat-completions APIs
-   have no equivalent, which is why no existing extension can reach this endpoint
-   by pointing a base URL at it.
-2. **The return type is built from the same map.** The extension reads the criteria
-   map during *bind* and constructs the `ENUM` from its keys, so the column type and
-   the model's option set cannot drift apart.
-3. **Mistakes fail at bind time.** An empty map, a duplicate option, more than 255
-   options, or a non-constant map are rejected before a single API call is made.
+Each function takes the row's text, then a **criteria** literal. The criteria tells
+the model which answers are permitted and decides the column's type, which is why
+they cannot drift apart, and why it must be constant.
 
-What this does **not** claim: that the answer is correct. Strict typing guarantees
-the value is in the set and the column has the right type. A wrong answer is still
-wrong.
-
-## API contract
-
-Verified directly against `https://api.typesafe.ai/openapi.json` and a live call,
-because the published docs differ from the served schema.
-
-| Question | `criteria` shape | Answer fields |
+| Call | Criteria | Column |
 |---|---|---|
-| `choice` | object, `option -> description` | `choice`, `confidence`, `probabilities` |
-| `score`  | array, an ordered rubric | `score` (continuous), `confidence`, `legend`, `probabilities` |
-| `noul`   | object with `true` / `false` | `noul` only, a probability in [0,1] |
+| `jev_choice(text, MAP{option: meaning})` | what each option means | `ENUM` of those options |
+| `jev_score(text, [worst, ..., best])` | an ordered rubric | `DOUBLE` on that scale |
+| `jev_noul(text, MAP{'true': …, 'false': …})` | what yes and no mean | `DOUBLE`, probability of yes |
+| `jev_ask(text, {name: criteria, …})` | any mix | `STRUCT`, one field per question |
 
-One request carries exactly **one state** and **many questions**, so a scalar
-function costs one HTTP call per row. Batching questions is the only lever.
+The descriptions are how the model is told what an option means. Write them like an
+instruction to a colleague.
 
-A real response, for the ticket "I want a refund for last month, the charge was wrong":
+Since three questions cost what one costs, ask them together. Fields take their type
+from the criteria shape; choice and score get a `<name>_confidence` beside them.
 
-```json
-{"model":"jev-1.13.0",
- "answers":{
-   "intent":{"type":"choice","choice":"refund","confidence":1.0,
-             "probabilities":{"refund":1.0,"bug":0.0,"praise":0.0}},
-   "severity":{"type":"score","score":2.1,"confidence":0.9, "...": "..."},
-   "urgent":{"type":"noul","noul":0.6}},
- "usage":{"input_tokens":412,"output_tokens":69}}
+```console
+D WITH asked AS (
+      SELECT id, jev_ask(body, {
+          intent:   MAP{'refund': 'wants money back', 'bug': 'something broken',
+                        'praise': 'a compliment'},
+          severity: ['trivial', 'minor', 'normal', 'serious', 'critical'],
+          urgent:   MAP{'true': 'needs a reply today', 'false': 'can wait'}
+      }) AS a FROM tickets)
+  SELECT id, a.intent, round(a.severity, 1) AS severity, round(a.urgent, 2) AS urgent
+  FROM asked ORDER BY id;
+┌───────┬─────────────────────────────────┬──────────┬────────┐
+│  id   │             intent              │ severity │ urgent │
+│ int32 │ enum('refund', 'bug', 'praise') │  double  │ double │
+├───────┼─────────────────────────────────┼──────────┼────────┤
+│     1 │ refund                          │      1.7 │   0.52 │
+│     2 │ bug                             │      3.0 │   0.49 │
+│     3 │ praise                          │      0.6 │   0.46 │
+└───────┴─────────────────────────────────┴──────────┴────────┘
 ```
 
-## Status
+An empty option map, a duplicate option, a one-level rubric, over 255 options or a
+non-constant criteria all fail when the query is planned, not on row 400,000.
 
-Working, four functions, each checked end to end against the live API:
+### Cost
 
-| Function | Criteria | Returns |
-|---|---|---|
-| `jev_choice(state, MAP{option: description})` | the option set | `ENUM(options...)`, built at bind |
-| `jev_score(state, [level, ...])` | an ordered rubric | `DOUBLE` on that scale |
-| `jev_noul(state, MAP{'true': ..., 'false': ...})` | what each answer means | `DOUBLE`, the probability of true |
-| `jev_ask(state, {name: criteria, ...})` | any mix of the above | `STRUCT`, one typed field per question |
+One request per row, so treat these like a join against a paid service. Rows in a
+chunk go out sixteen at a time. Identical requests are cached for the life of the
+process, which matters because DuckDB evaluates a function once per place it
+appears, so the same call in `WHERE` and `SELECT` would bill twice per row. Rate
+limits, server errors and dropped connections retry with backoff; anything else
+fails at once.
 
-`jev_ask` is the one to use for more than one question. Jev bills per state, so three
-questions about a row cost one request through `jev_ask` and three through the
-scalar functions. The field type follows the criteria shape: a `MAP` is a choice and
-becomes an `ENUM`, a `LIST` is a rubric and becomes a `DOUBLE`, and a `MAP` whose keys
-are only `true` and `false` is a yes/no question. Choice and score fields carry a
-`<name>_confidence` beside them.
-
-```sql
-WITH asked AS (
-    SELECT id, jev_ask(body, {
-        intent:   MAP{'refund': 'wants money back', 'bug': 'something broken'},
-        severity: ['trivial', 'minor', 'normal', 'serious', 'critical'],
-        urgent:   MAP{'true': 'needs a reply today', 'false': 'can wait'}
-    }) AS a FROM tickets)
-SELECT id, a.intent, a.severity, a.urgent
-FROM asked WHERE a.intent_confidence > 0.8;
+```console
+D SELECT * FROM jev_usage();
+┌──────────┬────────────┬──────────────┬───────────────┐
+│ requests │ cache_hits │ input_tokens │ output_tokens │
+│  int64   │   int64    │    int64     │     int64     │
+├──────────┼────────────┼──────────────┼───────────────┤
+│        3 │          0 │         1163 │           208 │
+└──────────┴────────────┴──────────────┴───────────────┘
 ```
 
-Shared by all three:
+`SET jev_on_error = 'null'` loses the row instead of the query.
 
-- `CREATE SECRET (TYPE jev, API_KEY '...')`, with optional `ENDPOINT` and `MODEL`.
-  No secret is a bind error, not a row-one failure.
-- One POST per row, the API's floor. Rows within a chunk go out concurrently:
-  16 rows at 200 ms each take 0.36 s, not 3.3 s.
-- An answer cache keyed on the request. DuckDB evaluates a volatile function once
-  per occurrence, so the same call in `WHERE` and `SELECT` was two bills per row.
-  Now one.
+## Next
 
-- Retry with backoff on 429 and 5xx, up to four attempts. Any other 4xx fails once.
-
-- `SET jev_on_error = 'null'` turns a row whose request failed after its retries into
-  `NULL` instead of failing the query. The default is `fail`.
-- `SELECT * FROM jev_usage()` reports what the process has spent so far: requests,
-  cache hits, and the input and output tokens the API charged. A careless query over
-  a large table is a large bill; this is the warning. The counters and the answer
-  cache are process-wide, not per connection or per database.
-
-Not yet: a build in the community extensions registry, a wasm target, a per-call
-`on_error`, and the answer probabilities as a `MAP` column.
-
-## Tests
-
-Three suites, all at the SQL seam. `make test` is the DuckDB standard and is what
-the distribution pipeline runs on every platform.
-
-```sh
-make test        # test/sql/*.test: bind-time behaviour, no network
-make test_http   # a mock endpoint: one POST per row, cache, retry, concurrency, on_error
-make test_live   # test/live/*.test against api.typesafe.ai; skipped without TYPESAFE_API_KEY
-make test_all
-```
-
-The live suite is pure SQL. It reads the key with `require-env` and never stores it.
-
-**Why is there Python in the tests?** The mock suite needs a server that answers
-with a recorded response and fails when told to, so that retry, the cache and
-`on_error` can be tested without spending a token. Python's standard library has
-that server in forty lines. Writing it in C++ would need a second build target for
-no gain, and Python is already required by the DuckDB toolchain this repo builds
-with: the format and tidy targets are Python scripts. The two peer extensions that
-test HTTP behaviour made the same choice.
-
-## CI
-
-Two jobs on a pull request, one build. `ci.yml` runs the DuckDB format check, which
-needs no build, and one Linux build followed by `make test`, `make test_http` and
-`make test_live`. The live suite turns on when a `TYPESAFE_API_KEY` repository
-secret exists and reports itself skipped otherwise.
-
-The DuckDB standard distribution pipeline, twelve platforms plus clang-tidy, is
-release-grade and runs on `main`, on `v*` tags, and on demand. Trigger it on a
-branch from the Actions tab before merging anything that touches the build or
-platform-specific code.
-
-## Building
-
-```sh
-GEN=ninja make release
-./build/release/duckdb -unsigned
-```
+- **Batching.** One request can carry many rows: 100 tickets classified correctly in
+  a single call, 129 ms, a third of the tokens per row. Not wired up yet.
+- **A playground**, so the idea can be tried without an install or a key.
+- **Autocomplete** that suggests options from the table's own schema.
+- Publishing to the DuckDB community registry.
 
 ## Licence
 
