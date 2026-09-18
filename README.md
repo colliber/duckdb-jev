@@ -54,121 +54,95 @@ What this does **not** claim: that the answer is correct. Strict typing guarante
 the value is in the set and the column has the right type. A wrong answer is still
 wrong.
 
-## API contract
+## Asking a question
 
-Verified directly against `https://api.typesafe.ai/openapi.json` and a live call,
-because the published docs differ from the served schema.
+Every function takes the row's text as its first argument and a **criteria**
+literal as its second. The criteria does two jobs at once: it is sent to the model
+as the set of permitted answers, and it decides the SQL type that comes back. That
+is why the two can never disagree. It must be a constant, because a type has to be
+known before the query runs.
 
-| Question | `criteria` shape | Answer fields |
+```console
+D CREATE SECRET (TYPE jev, API_KEY 'sk-...');
+```
+
+`ENDPOINT` and `MODEL` are optional. Without a secret, a query fails when it is
+planned rather than on its first row.
+
+| Call | Criteria you write | Column you get |
 |---|---|---|
-| `choice` | object, `option -> description` | `choice`, `confidence`, `probabilities` |
-| `score`  | array, an ordered rubric | `score` (continuous), `confidence`, `legend`, `probabilities` |
-| `noul`   | object with `true` / `false` | `noul` only, a probability in [0,1] |
+| `jev_choice(text, MAP{option: meaning})` | what each option means | `ENUM` of those options |
+| `jev_score(text, [worst, ..., best])` | an ordered rubric | `DOUBLE` on that scale |
+| `jev_noul(text, MAP{'true': …, 'false': …})` | what yes and no mean | `DOUBLE`, the probability of yes |
+| `jev_ask(text, {name: criteria, …})` | any mix of the three | `STRUCT`, one field per question |
 
-One request carries exactly **one state** and **many questions**, so a scalar
-function costs one HTTP call per row. Batching questions is the only lever.
+The descriptions are not decoration. They are how the model is told what each
+option means, so a useful one reads like an instruction to a colleague.
 
-A real response, for the ticket "I want a refund for last month, the charge was wrong":
+### Ask everything at once
 
-```json
-{"model":"jev-1.13.0",
- "answers":{
-   "intent":{"type":"choice","choice":"refund","confidence":1.0,
-             "probabilities":{"refund":1.0,"bug":0.0,"praise":0.0}},
-   "severity":{"type":"score","score":2.1,"confidence":0.9, "...": "..."},
-   "urgent":{"type":"noul","noul":0.6}},
- "usage":{"input_tokens":412,"output_tokens":69}}
+The API charges per piece of text, not per question, and carries only one piece of
+text per request. So three questions asked separately cost three requests, and
+`jev_ask` asks all three in one. Prefer it whenever you want more than one answer
+about a row.
+
+Each field's type follows the shape you wrote: a map becomes an `ENUM`, a list
+becomes a `DOUBLE` on the rubric, and a map keyed `true`/`false` becomes a
+probability. Choice and score fields get a `<name>_confidence` beside them, which
+the model derives from its own answer distribution.
+
+```console
+D WITH asked AS (
+      SELECT id, jev_ask(body, {
+          intent:   MAP{'refund': 'wants money back', 'bug': 'something broken',
+                        'praise': 'a compliment'},
+          severity: ['trivial', 'minor', 'normal', 'serious', 'critical'],
+          urgent:   MAP{'true': 'needs a reply today', 'false': 'can wait'}
+      }) AS a FROM tickets)
+  SELECT id, a.intent, round(a.severity, 1) AS severity, round(a.urgent, 2) AS urgent
+  FROM asked ORDER BY id;
+┌───────┬─────────────────────────────────┬──────────┬────────┐
+│  id   │             intent              │ severity │ urgent │
+│ int32 │ enum('refund', 'bug', 'praise') │  double  │ double │
+├───────┼─────────────────────────────────┼──────────┼────────┤
+│     1 │ refund                          │      1.7 │   0.52 │
+│     2 │ bug                             │      3.0 │   0.49 │
+│     3 │ praise                          │      0.6 │   0.46 │
+└───────┴─────────────────────────────────┴──────────┴────────┘
 ```
 
-## Functions
+### What a query costs
 
-| Function | Criteria | Returns |
-|---|---|---|
-| `jev_choice(state, MAP{option: description})` | the option set | `ENUM(options...)`, built at bind |
-| `jev_score(state, [level, ...])` | an ordered rubric | `DOUBLE` on that scale |
-| `jev_noul(state, MAP{'true': ..., 'false': ...})` | what each answer means | `DOUBLE`, the probability of true |
-| `jev_ask(state, {name: criteria, ...})` | any mix of the above | `STRUCT`, one typed field per question |
+One request per row is the floor, so treat these functions like a join against a
+paid service rather than like `upper()`. Three things soften it, and none of them
+need configuring:
 
-`jev_ask` is the one to use for more than one question. Jev bills per state, so three
-questions about a row cost one request through `jev_ask` and three through the
-scalar functions. The field type follows the criteria shape: a `MAP` is a choice and
-becomes an `ENUM`, a `LIST` is a rubric and becomes a `DOUBLE`, and a `MAP` whose keys
-are only `true` and `false` is a yes/no question. Choice and score fields carry a
-`<name>_confidence` beside them.
+- Rows in a chunk are requested **concurrently**, sixteen at a time.
+- Identical requests are **cached** for the life of the process. This matters more
+  than it sounds: DuckDB evaluates a function once per place it appears, so the same
+  call in `WHERE` and in `SELECT` would otherwise be billed twice per row.
+- Rate limits, server errors and dropped connections are **retried** with backoff,
+  four attempts. Any other error fails the query immediately, because retrying a
+  malformed request cannot help.
 
-```sql
-WITH asked AS (
-    SELECT id, jev_ask(body, {
-        intent:   MAP{'refund': 'wants money back', 'bug': 'something broken'},
-        severity: ['trivial', 'minor', 'normal', 'serious', 'critical'],
-        urgent:   MAP{'true': 'needs a reply today', 'false': 'can wait'}
-    }) AS a FROM tickets)
-SELECT id, a.intent, a.severity, a.urgent
-FROM asked WHERE a.intent_confidence > 0.8;
+Watch the bill as you go:
+
+```console
+D SELECT * FROM jev_usage();
+┌──────────┬────────────┬──────────────┬───────────────┐
+│ requests │ cache_hits │ input_tokens │ output_tokens │
+│  int64   │   int64    │    int64     │     int64     │
+├──────────┼────────────┼──────────────┼───────────────┤
+│        3 │          0 │         1163 │           208 │
+└──────────┴────────────┴──────────────┴───────────────┘
 ```
 
-Shared by all three:
+A row that still fails after its retries fails the whole query. If you would rather
+lose the row than the query, `SET jev_on_error = 'null'` puts `NULL` in that cell
+and carries on.
 
-- `CREATE SECRET (TYPE jev, API_KEY '...')`, with optional `ENDPOINT` and `MODEL`.
-  No secret is a bind error, not a row-one failure.
-- One POST per row, the API's floor. Rows within a chunk go out concurrently:
-  16 rows at 200 ms each take 0.36 s, not 3.3 s.
-- An answer cache keyed on the request. DuckDB evaluates a volatile function once
-  per occurrence, so the same call in `WHERE` and `SELECT` was two bills per row.
-  Now one.
-
-- Retry with backoff on 429 and 5xx, up to four attempts. Any other 4xx fails once.
-
-- `SET jev_on_error = 'null'` turns a row whose request failed after its retries into
-  `NULL` instead of failing the query. The default is `fail`.
-- `SELECT * FROM jev_usage()` reports what the process has spent so far: requests,
-  cache hits, and the input and output tokens the API charged. A careless query over
-  a large table is a large bill; this is the warning. The counters and the answer
-  cache are process-wide, not per connection or per database.
-
-Not yet: a build in the community extensions registry, a wasm target, a per-call
-`on_error`, and the answer probabilities as a `MAP` column.
-
-## Tests
-
-Three suites, all at the SQL seam. `make test` is the DuckDB standard and is what
-the distribution pipeline runs on every platform.
-
-```sh
-make test        # test/sql/*.test: bind-time behaviour, no network
-make test_http   # a mock endpoint: one POST per row, cache, retry, concurrency, on_error
-make test_live   # test/live/*.test against api.typesafe.ai; skipped without TYPESAFE_API_KEY
-make test_all
-```
-
-The live suite is pure SQL. It reads the key with `require-env` and never stores it.
-
-**Why is there Python in the tests?** The mock suite needs a server that answers
-with a recorded response and fails when told to, so that retry, the cache and
-`on_error` can be tested without spending a token. Python's standard library has
-that server in forty lines. Writing it in C++ would need a second build target for
-no gain, and Python is already required by the DuckDB toolchain this repo builds
-with: the format and tidy targets are Python scripts. The two peer extensions that
-test HTTP behaviour made the same choice.
-
-## CI
-
-Two jobs on a pull request, one build. `ci.yml` runs the DuckDB format check, which
-needs no build, and one Linux build followed by `make test`, `make test_http` and
-`make test_live`. The live suite turns on when a `TYPESAFE_API_KEY` repository
-secret exists and reports itself skipped otherwise.
-
-The DuckDB standard distribution pipeline, twelve platforms plus clang-tidy, is
-release-grade and runs on `main`, on `v*` tags, and on demand. Trigger it on a
-branch from the Actions tab before merging anything that touches the build or
-platform-specific code.
-
-## Building
-
-```sh
-GEN=ninja make release
-./build/release/duckdb -unsigned
-```
+Not yet: a published build in the DuckDB community registry, a wasm target, a
+per-call error mode, and the full answer distribution as a `MAP` column.
 
 ## Licence
 
