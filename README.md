@@ -14,11 +14,9 @@ The data you want to ask about already sits in a table or a Parquet file, and SQ
 the query language everyone has. So ask the question where the data is, instead of
 pulling it out, wrapping an API in a script and writing the answer back.
 
-That only works if asking is cheap, and this is where Jev earns its place. It does
-not write an answer and leave you to check the shape: it picks from the set you
-define, so the result is typed by construction rather than by validation. Not
-generating is also what makes it cheap, and cheap is what lets you ask something of
-every row instead of budgeting for it.
+Jev picks from a set you define instead of writing an answer you then check. The
+result is typed by construction, not by validation, and not generating is what makes
+it cheap enough to run on every row.
 
 ## Using it
 
