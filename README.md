@@ -1,37 +1,20 @@
 # duckdb-jev
 
 Ask a question about every row of a table, in SQL, and get a real SQL type back.
+A DuckDB extension over [Jev](https://typesafe.ai), TypeSafe's model for typed
+answers instead of text.
 
 ![duckdb-jev in the DuckDB shell](docs/demo.gif)
 
-A DuckDB extension over [Jev](https://typesafe.ai), TypeSafe's model for typed
-answers instead of text. The answer arrives as an `ENUM`, not a `VARCHAR` you cast
-and hope.
-
 ## Why
 
-The data you want to ask about already sits in a table or a Parquet file, SQL is the
-query language everyone has, and DuckDB reads the formats the data lives in, so ask
-the question where the data is. Typed output alone would not be worth an extension:
-there is a network call either way, so retries exist regardless, and models are
-getting better at schemas rather than worse. What matters is what the constraint
-bought. Jev "outputs all probabilities in parallel instead of autoregressively
-generating by token", so a model choosing among five known options skips the
-machinery a model writing a sentence needs. Three questions about a row cost what
-one costs, and none of it takes a tenth of a second. Being typed is what made it
-cheap enough to run per row, and a classification you can afford per row changes
-what you would attempt in SQL at all.
+The data you want to ask about already sits in a table or a Parquet file, and SQL is
+the query language everyone has. So ask the question where the data is, instead of
+pulling it out, wrapping an API in a script and writing the answer back.
 
-| | Server-side time |
-|---|---|
-| One question about a row | 49 to 104 ms |
-| Three questions about the same row | 53 to 91 ms |
-
-*Measured from Amsterdam against `api.typesafe.ai`, model `jev-1.13.0`, reading the
-service's own processing-time header; end to end I see ~700 ms, nearly all network.
-TypeSafe [claim](https://typesafe.ai/blog/introducing-system-one-models-and-jev) 40
-to 200 times faster than frontier models, from their own evaluation against
-non-reasoning baselines they chose. Nobody has published an independent benchmark.*
+Jev picks from a set you define instead of writing an answer you then check. The
+result is typed by construction, not by validation, and not generating is what makes
+it cheap enough to run on every row.
 
 ## Using it
 
@@ -42,9 +25,8 @@ D CREATE SECRET (TYPE jev, API_KEY 'sk-...');
 `ENDPOINT` and `MODEL` are optional. With no secret, queries fail when planned
 rather than part-way through.
 
-Each function takes the row's text, then a **criteria** literal. The criteria tells
-the model which answers are permitted and decides the column's type, which is why
-they cannot drift apart, and why it must be constant.
+Each function takes the row's text, then a **criteria** literal. The criteria is
+both the set of permitted answers and the column's type, so it must be constant.
 
 | Call | Criteria | Column |
 |---|---|---|
@@ -53,11 +35,10 @@ they cannot drift apart, and why it must be constant.
 | `jev_noul(text, MAP{'true': …, 'false': …})` | what yes and no mean | `DOUBLE`, probability of yes |
 | `jev_ask(text, {name: criteria, …})` | any mix | `STRUCT`, one field per question |
 
-The descriptions are how the model is told what an option means. Write them like an
-instruction to a colleague.
+The descriptions are the only thing telling the model what an option means.
 
-Since three questions cost what one costs, ask them together. Fields take their type
-from the criteria shape; choice and score get a `<name>_confidence` beside them.
+One request carries many questions, so ask them together. Each field takes its type
+from its criteria; choice and score carry a `<name>_confidence` beside them.
 
 ```console
 D WITH asked AS (
@@ -86,10 +67,9 @@ non-constant criteria all fail when the query is planned, not on row 400,000.
 
 One request per row, so treat these like a join against a paid service. Rows in a
 chunk go out sixteen at a time. Identical requests are cached for the life of the
-process, which matters because DuckDB evaluates a function once per place it
-appears, so the same call in `WHERE` and `SELECT` would bill twice per row. Rate
-limits, server errors and dropped connections retry with backoff; anything else
-fails at once.
+process. DuckDB evaluates a function once per place it appears, so without that the
+same call in `WHERE` and `SELECT` bills twice per row. Rate limits, server errors and
+dropped connections retry with backoff; anything else fails at once.
 
 ```console
 D SELECT * FROM jev_usage();
