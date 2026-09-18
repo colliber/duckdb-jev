@@ -58,32 +58,43 @@ growing one.
 ### The exciting part is what the constraint bought
 
 The interesting move is that TypeSafe did not trade anything away for the type
-guarantee. They added it, and in doing so got to rebuild the architecture around a
-much smaller job. A model that must emit one of five options does not have to
-generate a sentence, or a JSON object, or anything it might then have to be checked
-against. It has to pick. That is a different shape of problem, and it can be
-answered in a different way.
+guarantee. They added it, and in doing so got to change how the answer is produced
+at all. In their words, Jev "outputs all probabilities in parallel instead of
+autoregressively generating by token."
 
-Here is what that looks like from the outside, measured against the live API:
+That is the whole thing in one sentence. A model writing a sentence must produce it
+one token at a time, each conditioned on the last, because it does not know where it
+is going. A model choosing among five known options does not have that problem, and
+so does not need that machinery. Constraining the output is what made a different
+sampler possible. The type safety is not a feature bolted onto a language model; it
+is the premise that let the architecture be rebuilt.
+
+Here is what that looks like from outside, measured against the live API:
 
 | | Server-side time |
 |---|---|
 | One question about a row | 49 to 104 ms |
 | Three questions about the same row | 53 to 91 ms |
 
-Two things stand out. The first is that it answers in well under a tenth of a
-second. The second is stranger and more telling: asking three questions costs
-essentially the same as asking one. The work is not proportional to how much you
-ask, which is not how generating text behaves.
+Two things stand out. It answers in well under a tenth of a second. And asking three
+questions costs about what asking one costs, so the work is not proportional to how
+much you ask, which is not how generating text behaves.
 
-That is the real innovation, and the reason this extension exists. Not that the
-answer is well typed, but that being well typed is what let it get fast enough to
-put in the middle of a query over a whole table. A classification you can afford to
-run per row changes what you would even attempt in SQL.
+That is the reason this extension exists. Not that the answer is well typed, but
+that being well typed is what let it get fast enough to sit in the middle of a query
+over a whole table. A classification you can afford to run per row changes what you
+would attempt in SQL at all.
 
-*(Latency measured from Amsterdam against `api.typesafe.ai`, model `jev-1.13.0`,
-reading the service's own processing time rather than wall clock. End to end I see
-about 700 ms per call, nearly all of it network round trip.)*
+*How that was measured, so you can disagree with it: from Amsterdam against
+`api.typesafe.ai`, model `jev-1.13.0`, reading the service's own processing-time
+header rather than wall clock. End to end I see about 700 ms per call, nearly all of
+it network round trip. TypeSafe themselves claim 70 to 500 ms end to end and, on
+their [launch post](https://typesafe.ai/blog/introducing-system-one-models-and-jev),
+40 to 200 times faster than frontier models. That comparison is their own in-house
+evaluation against the non-reasoning modes of two models they chose, and the post
+calls its own headline figures "on the higher end of real world gains." Nobody has
+published an independent benchmark either way. Treat their multiplier as a claim and
+the table above as one person's measurement.*
 
 ## Using it
 
