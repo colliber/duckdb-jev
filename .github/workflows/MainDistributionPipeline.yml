@@ -11,6 +11,9 @@ on:
     # documentation change.
     paths-ignore:
       - '**.md'
+      - '**.gif'
+      - '**.png'
+      - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
   workflow_dispatch:
