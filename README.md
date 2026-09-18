@@ -4,30 +4,9 @@ Ask a question about every row of a table, in SQL, and get a real SQL type back.
 
 ![duckdb-jev in the DuckDB shell](docs/demo.gif)
 
-```console
-D CREATE TABLE tickets AS SELECT * FROM (VALUES
-      (1, 'I want a refund for last month, the charge was wrong'),
-      (2, 'The export button crashes on files over 100MB'),
-      (3, 'Great product, the new dashboard is lovely')) t(id, body);
-
-D SELECT id, jev_choice(body, MAP{
-      'refund': 'The customer wants money back',
-      'bug':    'The customer reports something broken',
-      'praise': 'The customer is complimenting the product'
-  }) AS intent
-  FROM tickets;
-┌───────┬─────────────────────────────────┐
-│  id   │             intent              │
-│ int32 │ enum('refund', 'bug', 'praise') │
-├───────┼─────────────────────────────────┤
-│     1 │ refund                          │
-│     2 │ bug                             │
-│     3 │ praise                          │
-└───────┴─────────────────────────────────┘
-```
-
-`intent` is an `ENUM`, not a `VARCHAR` you cast and hope. A DuckDB extension over
-[Jev](https://typesafe.ai), TypeSafe's model for typed answers instead of text.
+A DuckDB extension over [Jev](https://typesafe.ai), TypeSafe's model for typed
+answers instead of text. The answer arrives as an `ENUM`, not a `VARCHAR` you cast
+and hope.
 
 ## Why
 
