@@ -1,0 +1,116 @@
+# PR gate. Two jobs, one build.
+#
+#   format   the DuckDB format check: clang-format, black, cmake-format. No build,
+#            about a minute. Tidy needs a full build and runs on main instead.
+#   build    one Linux build, then every suite:
+#              make test        sqllogictests, the DuckDB standard
+#              make test_http   a mock endpoint that replays a recorded response and
+#                               fails when told to: cache, retry, concurrency, on_error
+#              make test_live   test/live against api.typesafe.ai, pure SQL, skipped
+#                               unless the TYPESAFE_API_KEY secret is set
+#
+# The twelve-platform distribution matrix and clang-tidy run on main, on tags and on
+# demand (MainDistributionPipeline.yml, workflow_dispatch). Run it on a branch before
+# merging anything that touches the build or platform-specific code.
+#
+# No key is stored here. Add TYPESAFE_API_KEY as a repository secret to turn the
+# live suite on; without it the suite reports itself skipped and the job passes.
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The vcpkg commit the distribution pipeline pins for this ci_tools_version.
+  VCPKG_COMMIT: 84bab45d415d22042bd0b9081aea57f362da3f35
+
+jobs:
+  format:
+    name: Format check
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5-variegata
+      extension_name: jev
+      format_checks: 'format'
+
+  build:
+    name: Build once, run every suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      # Shallow everywhere. The duckdb submodule alone carries years of history that
+      # a build never reads.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ninja-build ccache
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=2G" >> "$GITHUB_ENV"
+          # Compiler-invocation hashes only, so a fresh checkout path still hits.
+          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros" >> "$GITHUB_ENV"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-behaviour-${{ hashFiles('.gitmodules', 'CMakeLists.txt', 'vcpkg.json') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-behaviour-${{ hashFiles('.gitmodules', 'CMakeLists.txt', 'vcpkg.json') }}-
+            ccache-behaviour-
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/vcpkg
+            ~/.cache/vcpkg
+          key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: vcpkg
+        run: |
+          if [ ! -x ~/vcpkg/vcpkg ]; then
+            # fetch exactly the pinned commit, not the whole registry history
+            git init -q ~/vcpkg
+            git -C ~/vcpkg fetch -q --depth 1 https://github.com/microsoft/vcpkg.git "$VCPKG_COMMIT"
+            git -C ~/vcpkg checkout -q FETCH_HEAD
+            ~/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          fi
+          echo "VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
+
+      # EXT_FLAGS is the ci-tools makefile's hook into the cmake invocation. Putting
+      # ccache on PATH is not enough: the build names its compilers explicitly, so
+      # the launcher has to be passed to cmake. Without this the cold build is
+      # 34 minutes and the cache saves nothing.
+      - name: Build
+        run: |
+          GEN=ninja EXT_FLAGS="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache" \
+            make release
+
+      - name: sqllogictests
+        run: make test
+
+      - name: Mock endpoint suite
+        run: make test_http
+
+      # Skips itself when the secret is absent; make test_live handles the empty case.
+      - name: Live suite
+        run: make test_live
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+
+      # Save the caches even when a suite fails, so a red run still speeds up the next.
+      - name: ccache statistics
+        if: always()
+        run: ccache -s | head -5

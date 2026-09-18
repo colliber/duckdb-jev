@@ -1,14 +1,16 @@
-#
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
-#
+# The DuckDB standard distribution pipeline: twelve platform builds, sqllogictests
+# on each, and clang-tidy, which is itself a full build. That is release-grade and
+# expensive, so it runs on main, on tags, and on demand, not on every PR push.
+# PRs run ci.yml: one Linux build with every suite, plus the format check.
 name: Main Extension Distribution Pipeline
 on:
   push:
-  pull_request:
+    branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -18,7 +20,7 @@ jobs:
     with:
       duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
-      extension_name: waddle
+      extension_name: jev
 
   code-quality-check:
     name: Code Quality Check
@@ -26,5 +28,5 @@ jobs:
     with:
       duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
-      extension_name: waddle
+      extension_name: jev
       format_checks: 'format;tidy'

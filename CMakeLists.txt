@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.5)
 
 # Set extension name here
-set(TARGET_NAME waddle)
+set(TARGET_NAME jev)
 
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package. Feel free to remove or replace with other dependencies.
@@ -16,9 +16,9 @@ project(${TARGET_NAME})
 set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include_directories(src/include)
+include_directories(src/include duckdb/third_party/httplib duckdb/third_party/yyjson/include)
 
-set(EXTENSION_SOURCES src/waddle_extension.cpp)
+set(EXTENSION_SOURCES src/jev_extension.cpp src/jev_secret.cpp src/jev_client.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

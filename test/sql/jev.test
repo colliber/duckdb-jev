@@ -1,0 +1,111 @@
+# name: test/sql/jev.test
+# description: bind-time behaviour of jev_choice. Nothing here reaches the network.
+# group: [sql]
+
+require jev
+
+# Without a secret the query fails at bind, before any row is processed.
+statement error
+SELECT jev_choice('x', MAP{'a':'first','b':'second'});
+----
+no secret found
+
+statement ok
+CREATE SECRET (TYPE jev, API_KEY 'test-key', ENDPOINT 'http://127.0.0.1:1');
+
+# The return type is an ENUM derived from the criteria map keys.
+# DESCRIBE plans the query without executing it, so no request is made.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT jev_choice('anything', MAP{'refund':'wants money back','bug':'something broken'}) AS intent);
+----
+intent	ENUM('refund', 'bug')
+
+# A different call site gets a different type.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT jev_choice('anything', MAP{'yes':'affirmative','no':'negative'}) AS answer);
+----
+answer	ENUM('yes', 'no')
+
+# Bind rejects an empty criteria map.
+statement error
+SELECT jev_choice('x', MAP{}::MAP(VARCHAR, VARCHAR));
+----
+must not be empty
+
+# Bind rejects a non-constant criteria map.
+statement ok
+CREATE TABLE t2 AS SELECT 'x' AS body, MAP{'a':'first'} AS c;
+
+statement error
+SELECT jev_choice(body, c) FROM t2;
+----
+must be a constant
+
+# A NULL state yields a NULL answer without a request. The endpoint above is
+# unreachable, so this would fail loudly if a request were attempted.
+query I
+SELECT jev_choice(NULL, MAP{'a':'first','b':'second'}) IS NULL;
+----
+true
+
+# jev_score takes an ordered rubric and returns a DOUBLE on that scale.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT jev_score('anything', ['trivial','minor','normal','serious','critical']) AS severity);
+----
+severity	DOUBLE
+
+# A rubric needs at least two levels to be a scale.
+statement error
+SELECT jev_score('x', ['only one']);
+----
+at least two
+
+# jev_noul takes what true and false mean and returns the probability of true.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT jev_noul('anything', MAP{'true':'needs a reply today','false':'can wait'}) AS urgent);
+----
+urgent	DOUBLE
+
+# Only the keys true and false are meaningful.
+statement error
+SELECT jev_noul('x', MAP{'yes':'a','no':'b'});
+----
+true
+
+# jev_ask asks several questions in one request and returns a typed STRUCT.
+# The field type follows the criteria shape: a MAP is a choice and becomes an
+# ENUM; a LIST is a score rubric and becomes a DOUBLE; a MAP whose keys are only
+# true/false is a noul and becomes a DOUBLE. Choice and score carry a confidence.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT jev_ask('anything', {
+    intent:   MAP{'refund':'wants money back','bug':'something broken'},
+    severity: ['trivial','minor','normal','serious','critical'],
+    urgent:   MAP{'true':'needs a reply today','false':'can wait'}
+}) AS a);
+----
+a	STRUCT(intent ENUM('refund', 'bug'), intent_confidence DOUBLE, severity DOUBLE, severity_confidence DOUBLE, urgent DOUBLE)
+
+# The questions argument must be a STRUCT of name: criteria. An empty struct
+# literal is a parser error in DuckDB, so a non-struct is the reachable case.
+statement error
+SELECT jev_ask('x', 42);
+----
+must be a STRUCT
+
+# Each field's criteria must be a MAP or a LIST.
+statement error
+SELECT jev_ask('x', {mood: 'happy'});
+----
+must be a MAP
+
+# jev_usage() reports what this process has spent: one row, four counters. The
+# counters are process-wide, so their values depend on what ran before in the same
+# test binary; only the shape is asserted here. Values are asserted in
+# test/python/test_http.py, which starts a fresh process per query.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM jev_usage());
+----
+requests	BIGINT
+cache_hits	BIGINT
+input_tokens	BIGINT
+output_tokens	BIGINT
