@@ -1,12 +1,10 @@
 # duckdb-jev
 
 Ask a question about every row of a table, in SQL, and get a real SQL type back.
+A DuckDB extension over [Jev](https://typesafe.ai), TypeSafe's model for typed
+answers instead of text.
 
 ![duckdb-jev in the DuckDB shell](docs/demo.gif)
-
-A DuckDB extension over [Jev](https://typesafe.ai), TypeSafe's model for typed
-answers instead of text. The answer arrives as an `ENUM`, not a `VARCHAR` you cast
-and hope.
 
 ## Why
 
@@ -27,9 +25,8 @@ D CREATE SECRET (TYPE jev, API_KEY 'sk-...');
 `ENDPOINT` and `MODEL` are optional. With no secret, queries fail when planned
 rather than part-way through.
 
-Each function takes the row's text, then a **criteria** literal. The criteria tells
-the model which answers are permitted and decides the column's type, which is why
-they cannot drift apart, and why it must be constant.
+Each function takes the row's text, then a **criteria** literal. The criteria is
+both the set of permitted answers and the column's type, so it must be constant.
 
 | Call | Criteria | Column |
 |---|---|---|
@@ -38,11 +35,10 @@ they cannot drift apart, and why it must be constant.
 | `jev_noul(text, MAP{'true': …, 'false': …})` | what yes and no mean | `DOUBLE`, probability of yes |
 | `jev_ask(text, {name: criteria, …})` | any mix | `STRUCT`, one field per question |
 
-The descriptions are how the model is told what an option means. Write them like an
-instruction to a colleague.
+The descriptions are the only thing telling the model what an option means.
 
-Since three questions cost what one costs, ask them together. Fields take their type
-from the criteria shape; choice and score get a `<name>_confidence` beside them.
+One request carries many questions, so ask them together. Each field takes its type
+from its criteria; choice and score carry a `<name>_confidence` beside them.
 
 ```console
 D WITH asked AS (
@@ -71,10 +67,9 @@ non-constant criteria all fail when the query is planned, not on row 400,000.
 
 One request per row, so treat these like a join against a paid service. Rows in a
 chunk go out sixteen at a time. Identical requests are cached for the life of the
-process, which matters because DuckDB evaluates a function once per place it
-appears, so the same call in `WHERE` and `SELECT` would bill twice per row. Rate
-limits, server errors and dropped connections retry with backoff; anything else
-fails at once.
+process. DuckDB evaluates a function once per place it appears, so without that the
+same call in `WHERE` and `SELECT` bills twice per row. Rate limits, server errors and
+dropped connections retry with backoff; anything else fails at once.
 
 ```console
 D SELECT * FROM jev_usage();
